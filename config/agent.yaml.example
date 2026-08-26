@@ -1,0 +1,68 @@
+# cagent 端上配置：修改保存后立即生效（守护线程每秒热加载，无需重启）
+# 说明：
+# - model:   模型连接参数（provider 预留，当前仅 openai 兼容实现）
+# - prompts: 提示词覆盖；key 对应 planner_system / replan_system / react_system
+#            未列出的 key 使用内置默认；react_system 支持 {step} / {tools} 占位符
+
+model:
+  provider: openai
+  model: glm-5.1
+  api_key: xxx        # 也可用环境变量或明文；建议走环境变量
+  base_url: null                    # 兼容第三方 OpenAI 风格端点时填写
+  temperature: 0.0
+  max_tokens: 2048
+
+prompts:
+  # planner_system: 覆盖计划生成系统提示
+  # replan_system:  覆盖重规划系统提示
+  # react_system:   覆盖单步 ReAct 系统提示（可用 {step} {tools}）
+  # react_unconverged: 覆盖 ReAct 迭代耗尽未收敛时的兜底总结提示（user 消息追加）
+  # history_summarize_system: 覆盖 history 超窗条目的滚动摘要系统提示
+  # memory_extract: 覆盖长期记忆提取系统提示（可用 {tags_instruction}）
+  # summarize_system: 覆盖最终总结系统提示
+  # 示例（取消注释即生效）：
+  # react_system: |
+  #   你正在执行步骤：{step}
+  #   可用工具：{tools}
+  #   请先推理，需要时用工具，得出结论后直接回复，不要调用工具。
+  # react_unconverged: |
+  #   你已达到本步骤允许的最大推理—行动轮数，但尚未给出最终结论。
+  #   请基于以上全部思考过程与工具观察，立即给出该步骤的阶段性总结结论。
+  #   直接输出结论文本，不要再调用任何工具。
+  # summarize_system: |
+  #   请简洁总结各步骤执行结果，直接输出自然语言结论。
+
+# 迭代次数控制（可选，缺省使用内置默认值）
+max_steps: 20                  # 计划层：最多执行的 Step 数
+react_max_iterations: 5        # 单步 ReAct 内最多推理—行动轮数
+
+# 跨 step 上下文窗口（可选，缺省使用内置默认值）
+history_window: 10             # 注入后续步骤的最近 step 条目数；0 = 不限制
+observation_max_chars: 500     # 单条工具观察注入上下文时的截断长度；0 = 不截断
+history_summarize: true        # 超窗条目是否用 LLM 滚动摘要（false 时直接丢弃；无 LLM 时退化为文本压缩）
+
+# 工具系统（可选，缺省启用全部分组、不做动态选择）
+tools:
+  enabled_groups: null         # 启用的工具分组；null = 全部（default 组始终启用）
+  dynamic: false               # 开启后每 step 按「步骤描述+总目标」检索 Top-K 工具注入
+  max_per_step: 8              # dynamic 开启时注入的工具数上限；无命中回退全量
+
+# 长期记忆（分代晋升，借鉴 JVM：候选→多次确认→晋升，用户显式指定可直通）
+memory:
+  enabled: true
+  namespace: default
+  tenuring_threshold: 3        # 跨 N 个不同会话出现后晋升
+  candidate_ttl_days: 14       # 候选长期未复发则淘汰；0 = 永不过期
+  recall_k: 5                  # run 开始召回条数；0 = 关闭召回
+  recall_candidates: false     # 召回是否包含未晋升候选（默认只召回 tenured）
+  match_threshold: 0.6         # 去重合并的关键词相似度阈值
+  tags:
+    mode: hybrid               # implicit（LLM 自由生成）| explicit（枚举选择）| hybrid | off
+    implicit_max_tags: 5
+    categories:                # explicit / hybrid 模式下的固定分类
+      domain:
+        values: [work, life, study]
+        required: false
+      sensitivity:
+        values: [public, private]
+        required: false

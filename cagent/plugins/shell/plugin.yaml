@@ -1,0 +1,7 @@
+plugin: shell
+type: tools
+version: "1.0"
+group: shell
+summary: "命令执行工具组"
+detail: "提供 shell 命令执行、代码搜索、Git 操作等"
+author: cagent

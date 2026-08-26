@@ -1,0 +1,175 @@
+plugin: filesystem
+group: filesystem
+summary: "文件补丁修改工具"
+detail: |
+  仅提供文件补丁修改操作，不支持文件读取、目录列表等只读操作（这些由 shell 组的 cat/ls 等命令覆盖）。
+  支持 Add（新增文件）、Update（修改文件）、Delete（删除文件）、Move（移动/重命名文件）四种操作。
+
+tree:
+  - name: apply_patch
+    summary: "应用补丁修改文件（增删改移）"
+    detail: |
+      应用补丁修改文件。支持四种操作：Add（新增文件）、Update（修改文件）、Delete（删除文件）、Move（移动/重命名文件）。
+      所有操作通过统一的补丁文本描述，一次调用可修改多个文件。
+
+      ═══════════════════════════════════════════════
+      补丁总体结构
+      ═══════════════════════════════════════════════
+
+      每个操作块以 *** Begin Patch 开始、*** End Patch 结束。
+      一个 patch 参数中可包含多个操作块，按顺序执行。
+
+      ═══════════════════════════════════════════════
+      Add File — 新增文件
+      ═══════════════════════════════════════════════
+
+      用途：创建新文件，写入完整内容。
+
+      格式：
+      *** Begin Patch
+      *** Add File: <文件路径>
+      +<文件内容第 1 行>
+      +<文件内容第 2 行>
+      *** End Patch
+
+      规则：
+      - 每行内容以 + 开头，+ 后为实际文件内容
+      - 空行也要写成 +（即一个单独的 + 字符）
+      - 文件路径为相对路径，不能超出工作目录
+      - 父目录不存在时自动创建
+
+      示例：
+      *** Begin Patch
+      *** Add File: src/utils.py
+      +import os
+      +
+      +def hello():
+      +    return 'world'
+      *** End Patch
+
+      ═══════════════════════════════════════════════
+      Update File — 修改已有文件
+      ═══════════════════════════════════════════════
+
+      用途：对已有文件做局部修改（替换/删除/插入行）。
+
+      格式：
+      *** Begin Patch
+      *** Update File: <文件路径>
+      <上下文行（原样保留，用于定位）>
+      -<要删除的行>
+      +<要新增的行>
+      <上下文行>
+      *** End Patch
+
+      规则：
+      - 上下文行（无前缀）：从原文件中原样复制，用于定位修改位置
+      - - 开头的行：要删除的原文行（必须与原文件内容一致）
+      - + 开头的行：要新增的内容
+      - 上下文行 + 删除行组成"搜索块"，必须在原文件中连续存在
+      - 纯 + 行（无上下文、无删除行）表示在上下文位置插入
+
+      示例（替换行：将 return None 改为 return 42）：
+      *** Begin Patch
+      *** Update File: src/core.py
+      def get_value():
+      -    return None
+      +    return 42
+      *** End Patch
+
+      示例（插入行：在 line1 和 line2 之间插入 line1.5）：
+      *** Begin Patch
+      *** Update File: src/mod.py
+      line1
+      +line1.5
+      line2
+      *** End Patch
+
+      示例（删除行：移除 remove_me）：
+      *** Begin Patch
+      *** Update File: src/mod.py
+      keep1
+      -remove_me
+      keep2
+      *** End Patch
+
+      示例（多处修改：一个 patch 中多个 Update 块）：
+      *** Begin Patch
+      *** Update File: src/mod.py
+      def a():
+      -    return 1
+      +    return 10
+
+      def b():
+      -    return 2
+      +    return 20
+      *** End Patch
+
+      ═══════════════════════════════════════════════
+      Delete File — 删除文件
+      ═══════════════════════════════════════════════
+
+      用途：删除已有文件。
+
+      格式：
+      *** Begin Patch
+      *** Delete File: <文件路径>
+      *** End Patch
+
+      规则：
+      - 只需指定文件路径，无需内容行
+      - 文件必须存在
+      - 删除操作受 allow_delete 配置控制，默认可能未启用
+
+      示例：
+      *** Begin Patch
+      *** Delete File: src/old_module.py
+      *** End Patch
+
+      ═══════════════════════════════════════════════
+      Move File — 移动/重命名文件
+      ═══════════════════════════════════════════════
+
+      用途：移动或重命名文件。
+
+      格式：
+      *** Begin Patch
+      *** Move File: <原路径> -> <新路径>
+      *** End Patch
+
+      规则：
+      - 原路径文件必须存在
+      - 新路径如已存在文件且 allow_overwrite=false 则失败
+      - 新路径的父目录不存在时会自动创建
+
+      示例：
+      *** Begin Patch
+      *** Move File: src/old.py -> src/new.py
+      *** End Patch
+
+      ═══════════════════════════════════════════════
+      多操作混合
+      ═══════════════════════════════════════════════
+
+      一个 patch 中可包含多个不同类型的操作块：
+
+      *** Begin Patch
+      *** Add File: src/new.py
+      +created
+      *** End Patch
+      *** Begin Patch
+      *** Update File: src/existing.py
+      -old = 1
+      +new = 2
+      *** End Patch
+      *** Begin Patch
+      *** Move File: src/temp.py -> src/final.py
+      *** End Patch
+    execute:
+      mode: executor
+      handler: apply_patch
+    params:
+      patch:
+        type: string
+        required: true
+        description: "补丁文本"

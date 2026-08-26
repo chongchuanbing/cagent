@@ -1,0 +1,228 @@
+plugin: shell
+group: shell
+summary: "命令执行工具组"
+detail: "提供 shell 命令执行、代码搜索、Git 操作等"
+
+tree:
+  - name: run_command
+    summary: "执行任意 shell 命令"
+    detail: |
+      执行 shell 命令，返回 stdout/stderr/exit_code。
+      命令在工作目录下执行，受超时和黑名单限制。
+
+      参数：
+      - command（必填）：完整的 shell 命令
+      - timeout（可选，默认 30）：超时秒数
+      - cwd（可选，默认工作目录）：工作目录
+
+      示例：
+      run_command(path="shell.run_command", params={"command": "npm test", "timeout": 60})
+
+      规则：
+      - 命令在工作目录下执行，不能越界
+      - 黑名单命令会被拦截（如 rm -rf /、sudo）
+      - stdout/stderr 自动截断
+    execute:
+      mode: shell
+      command_template: null
+    params:
+      command:
+        type: string
+        required: true
+        description: "完整的 shell 命令"
+      timeout:
+        type: integer
+        default: 30
+        description: "超时秒数"
+      cwd:
+        type: string
+        default: null
+        description: "工作目录（默认项目根）"
+
+  - name: rg
+    summary: "按正则搜索文件内容（ripgrep）"
+    detail: |
+      使用 ripgrep 搜索文件内容。模型生成完整的 rg 命令。
+      框架负责安全执行（超时、目录限制、输出截断）。
+
+      常用参数：
+      - --line-number / -n：显示行号
+      - -e <pattern>：正则表达式
+      - -g <glob>：文件名过滤（如 -g "*.py"）
+      - --type <type>：文件类型（如 --type py）
+      - --hidden：包含隐藏文件
+      - -i：忽略大小写
+      - -v：反向匹配
+
+      示例：
+      rg --line-number -e "def main" -g "*.py" src/
+      rg -n "TODO" --type py
+
+      注意：如系统未安装 rg，会回退到 grep -rn。
+    execute:
+      mode: shell
+      command_template: null
+    params:
+      command:
+        type: string
+        required: true
+        description: "完整的 rg 命令"
+
+  - name: fd
+    summary: "按文件名模式查找文件（fd）"
+    detail: |
+      使用 fd 查找文件。模型生成完整的 fd 命令。
+      框架负责安全执行。
+
+      常用参数：
+      - --type / -t：类型（f=文件, d=目录, l=链接）
+      - --extension / -e：扩展名过滤
+      - --hidden / -H：包含隐藏文件
+      - --max-depth / -d：最大深度
+
+      示例：
+      fd --type f --extension py src/
+      fd -t d "test" --max-depth 3
+
+      注意：如系统未安装 fd，会回退到 find。
+    execute:
+      mode: shell
+      command_template: null
+    params:
+      command:
+        type: string
+        required: true
+        description: "完整的 fd 命令"
+
+  - name: sed
+    summary: "查看文件指定行内容（sed）"
+    detail: |
+      使用 sed 查看文件指定行范围的内容，带行号输出。
+      模型生成完整命令，框架负责安全执行。
+
+      常用用法：
+      - 查看全文（带行号）：sed -n '1,$p' <file> | cat -n
+      - 查看指定行范围：sed -n '10,30p' <file>
+      - 查看指定行范围（带行号）：sed -n '10,30=' <file>; sed -n '10,30p' <file>
+      - 查看前 N 行：sed -n '1,20p' <file>
+      - 查看后 N 行：sed -n '$-19,$p' <file>（部分系统不支持，可用 tail -n 20 <file>）
+      - 按模式匹配行：sed -n '/pattern/p' <file>
+
+      示例：
+      sed -n '15,50p' src/agent.py
+      sed -n '/def main/,/return/p' src/agent.py
+
+      注意：
+      - sed -n 'X,Yp' 输出第 X 到 Y 行（不含行号，可配合 cat -n 或 = 操作）
+      - sed -n 'Xp' 输出第 X 行
+      - 路径为相对路径，不能超出工作目录
+    execute:
+      mode: shell
+      command_template: null
+    params:
+      command:
+        type: string
+        required: true
+        description: "完整的 sed 命令"
+
+  - name: git
+    summary: "Git 操作子组"
+    children:
+      - name: status
+        summary: "查看 Git 状态"
+        detail: |
+          执行 git status 查看工作区状态。
+          模型生成完整命令。
+        execute:
+          mode: shell
+          command_template: null
+        params:
+          command:
+            type: string
+            required: true
+            description: "完整的 git status 命令"
+
+      - name: diff
+        summary: "查看 Git 差异"
+        detail: |
+          执行 git diff 查看差异。
+          模型生成完整命令。
+        execute:
+          mode: shell
+          command_template: null
+        params:
+          command:
+            type: string
+            required: true
+            description: "完整的 git diff 命令"
+
+      - name: log
+        summary: "查看 Git 日志"
+        detail: |
+          执行 git log 查看提交历史。
+          模型生成完整命令。
+
+          示例：
+          git log --oneline -10
+          git log --author="张三" --since="1 week ago"
+        execute:
+          mode: shell
+          command_template: null
+        params:
+          command:
+            type: string
+            required: true
+            description: "完整的 git log 命令"
+
+      - name: add
+        summary: "暂存文件"
+        detail: |
+          执行 git add 暂存文件。
+          模型生成完整命令。
+
+          示例：
+          git add .
+          git add src/agent.py
+        execute:
+          mode: shell
+          command_template: null
+        params:
+          command:
+            type: string
+            required: true
+            description: "完整的 git add 命令"
+
+      - name: commit
+        summary: "提交代码"
+        detail: |
+          执行 git commit 提交。
+          模型生成完整命令。
+
+          示例：
+          git commit -m "fix: 修复登录bug"
+          git commit -am "feat: 新增搜索功能"
+        execute:
+          mode: shell
+          command_template: null
+        params:
+          command:
+            type: string
+            required: true
+            description: "完整的 git commit 命令"
+
+      - name: push
+        summary: "推送到远程"
+        detail: |
+          执行 git push 推送到远程仓库。
+          模型生成完整命令。
+
+          示例：
+          git push origin main
+        execute:
+          mode: shell
+          command_template: null
+        params:
+          command:
+            type: string
+            required: true
+            description: "完整的 git push 命令"

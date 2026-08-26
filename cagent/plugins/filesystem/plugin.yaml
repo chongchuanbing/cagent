@@ -1,0 +1,7 @@
+plugin: filesystem
+type: tools
+version: "1.0"
+group: filesystem
+summary: "文件补丁修改工具"
+detail: "仅提供文件补丁修改操作（Add 新增、Update 修改、Delete 删除、Move 移动/重命名），不支持文件读取和目录列表等只读操作（由 shell 组的 cat/ls 等命令覆盖）"
+author: cagent
