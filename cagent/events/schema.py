@@ -24,6 +24,7 @@ class EventType(str, Enum):
     USER_INPUT_REQUEST = "user_input_request"  # 请求用户补充信息
     MEMORY_RECALLED = "memory_recalled"        # 长期记忆召回注入上下文
     MEMORY_PROMOTED = "memory_promoted"        # 记忆晋升为长期记忆
+    WORKSPACE_WRITE = "workspace_write"        # 会话向空间（workspace://）写入文件（审计）
     FINAL_ANSWER = "final_answer"        # 最终答案
     ERROR = "error"                      # 运行错误
 

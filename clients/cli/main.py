@@ -17,6 +17,7 @@
   python -m clients.cli memory list --status candidate
 """
 import argparse
+import logging
 import os
 from typing import List, Optional
 
@@ -64,12 +65,12 @@ def _build_agent(config_path: Optional[str] = None, emitter=None):
     from cagent.config import ConfigProvider
     from cagent.core import Agent
     from cagent.storage import get_storage
-    from cagent.tools import ToolRegistry, add
+    from cagent.tools import ToolRegistry
     from cagent.tools.builtin import FeedbackTool, RememberTool
     from cagent.plugins import (
         PluginManager, ToolGuideTool, RunToolTool, ShellExecutor,
         McpPluginLoader, McpClientManager,
-        SkillsPluginLoader, SkillGuideTool, RunSkillTool,
+        SkillsPluginLoader, SkillGuideTool, RunSkillTool, ReadSkillFileTool,
     )
 
     cfg = ConfigProvider(config_path) if config_path else ConfigProvider()
@@ -101,13 +102,39 @@ def _build_agent(config_path: Optional[str] = None, emitter=None):
     mcp_manager = McpClientManager()
     mcp_manager._clients = mcp_clients
 
-    # Shell 执行器
+    # Shell 执行器（注入 PathSpace 收编命令体路径沙箱）
     shell_config = dict(loaded.get("shell_config", {}))
     shell_config.setdefault("work_dir", work_dir)
-    shell_executor = ShellExecutor(shell_config)
+    # 读取语义阈值（与 AgentConfig.read_* 对齐）
+    shell_config["read_max_lines"] = agent_config.read_max_lines
+    shell_config["read_line_max_chars"] = agent_config.read_line_max_chars
+    shell_config["read_max_chars"] = agent_config.read_max_chars
+    shell_config["block_cat"] = agent_config.block_cat
+    # PathSpace 唯一构造入口：由配置 paths.* 驱动，端上只覆盖 plugins/config 目录
+    path_space = cfg.build_path_space(
+        work_dir, plugins_dir=plugins_dir,
+        config_dir=_os.path.dirname(cfg.path) or None,
+    )
+    # 系统级沙箱后端（bwrap → seatbelt → user → local 降级链）
+    from cagent.runtime.sandbox import SandboxSettings, select_backend
+    sb = agent_config.sandbox
+    sandbox_settings = SandboxSettings(
+        mode=sb.mode,
+        network_deny=(sb.network == "deny"),
+        extra_readable=tuple(sb.extra_readable),
+        user=sb.user,
+    )
+    shell_backend = select_backend(
+        sandbox_settings, logger=logging.getLogger("cagent.sandbox"),
+    )
+    shell_executor = ShellExecutor(shell_config, path_space=path_space, backend=shell_backend)
+
+    # 环境探测（用于工具可用性检查和回退提示）
+    from cagent.plugins.capability import CapabilityProbe
+    capability = CapabilityProbe(cfg.data_dir)
 
     # 通用披露+执行工具（tools + mcp 统一）
-    guide = ToolGuideTool(loaded["tree"])
+    guide = ToolGuideTool(loaded["tree"], capability=capability)
     runner = RunToolTool(
         loaded["tree"], loaded["executors"],
         shell_executor=shell_executor,
@@ -119,16 +146,20 @@ def _build_agent(config_path: Optional[str] = None, emitter=None):
     skills = skills_loader.load_all(agent_config.skills)
     skill_guide = SkillGuideTool(skills)
     run_skill = RunSkillTool(skills)
+    read_skill_file = ReadSkillFileTool(skills, path_space=path_space)
 
     tools = ToolRegistry()
-    tools.register(add)
     tools.register(guide)
     tools.register(runner)
     tools.register(skill_guide)
     tools.register(run_skill)
+    tools.register(read_skill_file)
     if emitter is not None:
         tools.register(FeedbackTool(emitter=emitter))
-    agent = Agent(tools=tools, config=cfg, storage=get_storage(cfg.data_dir), emitter=emitter)
+    agent = Agent(
+        tools=tools, config=cfg, storage=get_storage(cfg.data_dir, path_space=path_space),
+        emitter=emitter, path_space=path_space,
+    )
     if agent.memory is not None:
         tools.register(RememberTool(agent.memory))
     return agent, cfg
@@ -142,7 +173,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     emitter = EventEmitter()
     emitter.subscribe(create_display_handler())
     agent, _ = _build_agent(args.config, emitter=emitter)
-    agent.run(args.goal, session_id=args.session_id, resume=args.resume)
+    agent.run(args.goal, session_id=args.session_id, resume=args.resume,
+              space_dir=getattr(args, "space", None))
     # 最终答案已由 FINAL_ANSWER 事件渲染，无需重复 print
     return 0
 
@@ -179,7 +211,8 @@ def cmd_sessions_list(args: argparse.Namespace) -> int:
     from cagent.storage import get_storage
 
     cfg = ConfigProvider(args.config, watch=False) if args.config else ConfigProvider(watch=False)
-    storage = get_storage(cfg.data_dir)
+    path_space = cfg.build_path_space()
+    storage = get_storage(cfg.data_dir, path_space=path_space)
     metas = [k for k in storage.list_keys("sessions/") if k.endswith("meta.json")]
     if not metas:
         print("（暂无会话）")
@@ -202,7 +235,8 @@ def _memory_store(args: argparse.Namespace):
     data_dir = getattr(args, "data_dir", None)
     cfg = ConfigProvider(args.config, watch=False, data_dir=data_dir) if args.config else ConfigProvider(watch=False, data_dir=data_dir)
     mcfg = cfg.get_config().memory
-    return LongTermMemory(get_storage(cfg.data_dir), namespace=mcfg.namespace)
+    path_space = cfg.build_path_space()
+    return LongTermMemory(get_storage(cfg.data_dir, path_space=path_space), namespace=mcfg.namespace)
 
 
 def cmd_memory_list(args: argparse.Namespace) -> int:
@@ -273,10 +307,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("goal", help="任务目标")
     p_run.add_argument("--session-id", default=None, help="指定会话 ID（用于回放/续跑）")
     p_run.add_argument("--resume", action="store_true", default=False, help="从指定会话的历史上下文继续执行")
+    p_run.add_argument("--space", default=None, help="项目空间目录（如代码仓库根）；未指定时所有生成文件落会话目录")
     p_run.set_defaults(func=cmd_run)
 
     p_chat = sub.add_parser("chat", help="交互式会话模式")
     p_chat.add_argument("--session-id", default=None, help="续接指定会话 ID")
+    p_chat.add_argument("--space", default=None, help="项目空间目录（如代码仓库根）；未指定时所有生成文件落会话目录")
     p_chat.set_defaults(func=cmd_chat)
 
     p_cfg = sub.add_parser("config", help="查看/修改配置")

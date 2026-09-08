@@ -6,7 +6,7 @@ from .manager import PluginManager, PluginExecutor, ToolsPluginLoader
 from .mcp_client import McpClient, McpClientManager
 from .mcp_loader import McpPluginLoader
 from .skill_loader import SkillDefinition, SkillsPluginLoader
-from .skill_executor import SkillGuideTool, RunSkillTool
+from .skill_executor import SkillGuideTool, RunSkillTool, ReadSkillFileTool
 
 __all__ = [
     "OperationNode",
@@ -24,4 +24,5 @@ __all__ = [
     "SkillsPluginLoader",
     "SkillGuideTool",
     "RunSkillTool",
+    "ReadSkillFileTool",
 ]

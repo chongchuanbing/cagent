@@ -1,7 +1,8 @@
 """会话记录器：把一次 Agent 运行的过程持久化到 storage。"""
 import json
+import re
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .base import StorageBackend
 
@@ -41,28 +42,42 @@ class SessionRecorder:
         meta["finished_at"] = datetime.now().isoformat(timespec="seconds")
         self.storage.write_json(f"{self._prefix}/meta.json", meta)
 
+    def record_workspace_write(self, path: str, op: str) -> None:
+        """登记一次空间（workspace://）写入，供事后审计与 resume 追溯。
+
+        path 为相对空间根的路径；op 为操作类型（add/update/delete/move）。
+        """
+        meta = self.storage.read_json(f"{self._prefix}/meta.json") or {}
+        writes = meta.setdefault("workspace_writes", [])
+        entry = {
+            "path": path,
+            "op": op,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+        }
+        writes.append(entry)
+        meta["workspace_writes"] = writes
+        self.storage.write_json(f"{self._prefix}/meta.json", meta)
+
     # ── 会话恢复 ──────────────────────────────────────────
 
     def load_meta(self) -> dict:
         """读取会话元信息。"""
         return self.storage.read_json(f"{self._prefix}/meta.json") or {}
 
-    def load_history(self, max_obs_chars: int = 500) -> List[dict]:
+    def load_history(self) -> List[dict]:
         """从 trace.jsonl 重建 history 条目，供后续 run 注入上下文。
 
-        trace 条目格式（由 AgentLoop._history_entry 产生）：
-          {step_id, description, success, output, observations: [{tool, args, result}]}
+        trace.jsonl 每行是 ReActEngine.last_trace 的原始条目（全量保留，用于审计）：
+          {thought: ...} / {action: {tool_name, args}, observation: str} / {final: str}
 
-        trace.jsonl 每行是 ReActEngine.last_trace 的原始条目：
-          {thought: ...} / {action: Action, observation: str} / {final: str, unconverged?: bool}
-
-        重建逻辑：按 action/final 分组，还原成 history 条目。
+        重建时只提取最后一条 final 作为上轮 step 的交付结论（output）。
+        ReAct 内部的所有中间过程（包括工具调用、用户反馈等）均不进会话上下文，
+        这些信息保留在 trace.jsonl 中用于审计/调试。
         """
         text = self.storage.read_text(f"{self._prefix}/trace.jsonl")
         if not text:
             return []
-        # 收集原始 trace 条目
-        raw_entries = []
+        raw_entries: List[dict] = []
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -75,22 +90,10 @@ class SessionRecorder:
         if not raw_entries:
             return []
 
-        # 按最后一条 final 分段，每段构成一个 history 条目
-        # 简化处理：把整个 trace 汇总为一条历史
-        observations = []
+        # 提取最后一条 final 作为交付结论
         final_output = ""
         for entry in raw_entries:
-            if "action" in entry:
-                action = entry["action"]
-                obs = entry.get("observation", "")
-                if len(obs) > max_obs_chars:
-                    obs = obs[:max_obs_chars] + f"…（已截断，原 {len(obs)} 字符）"
-                observations.append({
-                    "tool": action.get("tool_name", ""),
-                    "args": action.get("args", {}),
-                    "result": obs,
-                })
-            elif "final" in entry:
+            if "final" in entry:
                 final_output = entry["final"]
 
         meta = self.load_meta()
@@ -99,7 +102,6 @@ class SessionRecorder:
             "description": meta.get("goal", ""),
             "success": True,
             "output": final_output,
-            "observations": observations,
         }]
 
     def load_last_answer(self) -> str:

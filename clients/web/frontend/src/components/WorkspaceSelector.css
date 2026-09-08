@@ -1,0 +1,116 @@
+.workspace-selector {
+  position: relative;
+  display: inline-block;
+}
+
+.ws-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: transparent;
+  border-radius: 6px;
+  color: #4b5563;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.ws-trigger:hover {
+  background-color: #f3f4f6;
+  color: #1f2937;
+}
+
+.ws-icon {
+  font-size: 13px;
+}
+
+.ws-label {
+  font-weight: 500;
+}
+
+.ws-caret {
+  font-size: 10px;
+  color: #9ca3af;
+}
+
+.ws-dropdown {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 280px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+  padding: 6px;
+  z-index: 100;
+}
+
+.ws-section-title {
+  font-size: 11px;
+  color: #9ca3af;
+  padding: 6px 10px 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.ws-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background-color 0.12s;
+}
+
+.ws-item:hover {
+  background-color: #f3f4f6;
+}
+
+.ws-item.active {
+  background-color: #e0e7ff;
+}
+
+.ws-browse {
+  border-top: 1px dashed #e5e7eb;
+  margin-top: 4px;
+  padding-top: 10px;
+}
+
+.ws-item-icon {
+  font-size: 14px;
+  color: #6b7280;
+  width: 20px;
+  text-align: center;
+}
+
+.ws-item-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.ws-item-name {
+  font-size: 13px;
+  color: #1f2937;
+  font-weight: 500;
+}
+
+.ws-item-path {
+  font-size: 11px;
+  color: #9ca3af;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-check {
+  color: #0066ff;
+  font-weight: 700;
+}
+
+.ws-divider {
+  height: 1px;
+  background-color: #e5e7eb;
+  margin: 4px 0;
+}

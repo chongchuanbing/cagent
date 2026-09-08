@@ -1,5 +1,5 @@
 """配置 schema：模型与提示词的可序列化定义。"""
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -116,6 +116,47 @@ class SkillsConfig(BaseModel):
     max_recursion: int = 3
 
 
+class PathSpaceConfig(BaseModel):
+    """路径空间配置：PathSpace 的唯一事实来源（详见 docs/path-management-design.md）。
+
+    所有目录相对 `base_dir` 解析；留 None 表示取 PathSpace 内置默认
+    （work_dir → base_dir，data_dir → ".data"）。
+    - base_dir：端上注入的基准目录，留空则用调用方传入的当前工作目录；
+    - work_dir：工具操作沙箱根（模型看到的是 workspace://）；
+    - data_dir：框架私有数据存储（默认对模型隐藏）；
+    - allow_paths / allow_symlink_targets：受信外挂区，用于合法的越界访问。
+    """
+
+    base_dir: Optional[str] = None
+    work_dir: Optional[str] = None
+    data_dir: str = ".data"
+    plugins_dir: Optional[str] = None
+    config_dir: Optional[str] = None
+    # 空间根目录（如项目代码目录）：null = 无空间模式（所有生成文件落会话目录）；
+    # 指定后 workspace:// 挂空间根，结构化工具写入需显式 scheme 并登记审计
+    space_dir: Optional[str] = None
+    allow_paths: List[str] = Field(default_factory=list)
+    allow_symlink_targets: List[str] = Field(default_factory=list)
+    expose_data_to_llm: bool = False
+
+
+class SandboxConfig(BaseModel):
+    """系统级沙箱配置（详见 docs/design/sandbox-design.md）。
+
+    - mode：off = LocalBackend 裸执行（校验层仍在）；
+      auto = 按能力探测降级（bwrap → seatbelt → user → local，落到 local 记警告）；
+      strict = 探测失败则拒绝执行 shell（安全优先场景）；
+    - network：deny = shell 默认禁网（内置联网工具走主进程 httpx，不受影响）；
+    - extra_readable：额外只读前缀（罕见场景，一般用 paths.allow_paths 声明）；
+    - user：UserBackend 专用低权限用户（需预先配置 sudoers 免密白名单）。
+    """
+
+    mode: Literal["off", "auto", "strict"] = "off"
+    network: Literal["deny", "allow"] = "deny"
+    extra_readable: List[str] = Field(default_factory=list)
+    user: Optional[str] = None
+
+
 class AgentConfig(BaseModel):
     """端上配置文件（agent.yaml）对应的顶层结构。"""
 
@@ -129,6 +170,13 @@ class AgentConfig(BaseModel):
     history_window: int = 10            # 注入后续步骤的最近 step 条目数；0 = 不限制
     observation_max_chars: int = 500    # 单条工具观察注入上下文时的截断长度；0 = 不截断
     history_summarize: bool = True      # 超窗条目是否用 LLM 滚动摘要（无 LLM 时退化为文本压缩）
+    # 读取语义阈值（针对 shell_exec 识别到的「读取类」命令，如 sed -n / head / grep -n）
+    # 与 observation_max_chars 的区别：observation_max_chars 是兜底；read_* 是读取视图专用，
+    # 行号化 + 头部契约 + 续读指令，按行（而非字符）截断，截断后模型仍能识别与续读。
+    read_max_lines: int = 2000          # 读取类输出窗口（行）：单次最多返回的行数
+    read_line_max_chars: int = 2000     # 读取类单行字符上限（防 JSON 单行撑爆）
+    read_max_chars: int = 30000         # 读取类总渲染字符上限（防 2000 行×80 字符撑爆上下文）
+    block_cat: bool = True              # shell.run_command 禁止 cat 整读（无法指定行范围）
     # 长期记忆（分代晋升）
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     # 工具系统（分组 / 动态选择 / 插件）
@@ -137,3 +185,7 @@ class AgentConfig(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     # 技能系统（多目录动态加载，Agent Skills 开放标准）
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    # 路径空间（workspace:// / data:// / skills:// 等挂载点的唯一事实来源）
+    paths: PathSpaceConfig = Field(default_factory=PathSpaceConfig)
+    # 系统级沙箱（bwrap / seatbelt / 低权限用户，shell 执行的第二道防线）
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)

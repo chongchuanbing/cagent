@@ -21,3 +21,8 @@ cagent/skills/code-review
 cagent/skills/refactor
 cagent/skills/test-gen
 config/agent.yaml
+.pids
+cagent/skills/tencent-docx
+cagent/skills/tencent-pptx
+cagent/skills/agent-browser
+clients/web/frontend/node_modules

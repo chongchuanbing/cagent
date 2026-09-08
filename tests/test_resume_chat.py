@@ -48,7 +48,7 @@ class TestSessionRecorderHistory:
             assert history == []
 
     def test_load_history_from_trace(self):
-        """从 trace.jsonl 重建 history。"""
+        """从 trace.jsonl 重建 history：只保留最后一条 final 作为交付结论。"""
         with tempfile.TemporaryDirectory() as d:
             storage = get_storage(d)
             recorder = SessionRecorder(storage, "test-sid")
@@ -67,27 +67,31 @@ class TestSessionRecorderHistory:
             entry = history[0]
             assert entry["description"] == "测试目标"
             assert entry["output"] == "3+5=8"
-            assert len(entry["observations"]) == 1
-            assert entry["observations"][0]["tool"] == "add"
-            assert entry["observations"][0]["result"] == "8"
+            # 中间工具调用不进上下文，observations 字段不存在
+            assert "observations" not in entry
+            # user_feedback 字段也不存在
+            assert "user_feedback" not in entry
 
-    def test_load_history_observation_truncation(self):
-        """超长观察被截断。"""
+    def test_load_history_no_intermediate_process(self):
+        """普通工具调用不进入 history 上下文，只保留 final。"""
         with tempfile.TemporaryDirectory() as d:
             storage = get_storage(d)
             recorder = SessionRecorder(storage, "test-sid")
             recorder.record_meta("目标")
-            long_obs = "x" * 1000
+            # 只有普通工具调用
             recorder.record_trace({
                 "action": {"tool_name": "long_tool", "args": {}},
-                "observation": long_obs,
+                "observation": "x" * 1000,
             })
             recorder.record_trace({"final": "done"})
 
-            history = recorder.load_history(max_obs_chars=50)
-            obs = history[0]["observations"][0]["result"]
-            assert "截断" in obs
-            assert len(obs) < 100
+            history = recorder.load_history()
+            assert len(history) == 1
+            # 只保留 final 作为 output
+            assert history[0]["output"] == "done"
+            # 无 observations / user_feedback
+            assert "observations" not in history[0]
+            assert "user_feedback" not in history[0]
 
     def test_load_last_answer(self):
         """读取最后一条 final。"""
@@ -185,7 +189,7 @@ class TestLoopPriorHistory:
             "description": "上轮目标",
             "success": True,
             "output": "上轮结果：重要信息",
-            "observations": [],
+            "user_feedback": [],
         }]
 
         reg = ToolRegistry()

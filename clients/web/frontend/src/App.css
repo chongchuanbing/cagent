@@ -1,0 +1,12 @@
+.app {
+  display: flex;
+  width: 100%;
+  height: 100%;
+}
+
+/* 响应式布局 */
+@media (max-width: 768px) {
+  .app {
+    flex-direction: column;
+  }
+}

@@ -200,6 +200,61 @@ def _find_block(lines: List[str], block: List[str], start: int = 0) -> int:
 # ── 执行函数 ──────────────────────────────────────────────
 
 
+def _scoped_resolve(rel: str) -> Optional[str]:
+    """会话作用域内的写路径解析；无作用域时返回 None（走原 PathGuard）。
+
+    规则（会话路径隔离）：
+    - scheme://（session:// / workspace://）→ 经会话 PathSpace 解析 + assert_safe(write)
+    - 裸相对路径 → scratch（临时/中间文件落会话目录）
+    - 绝对路径 → 必须位于 scratch 或空间根内，否则 PermissionError
+    """
+    from cagent.runtime.session_scope import current_scope
+
+    scope = current_scope()
+    if scope is None:
+        return None
+    s = rel.strip()
+    if "://" in s:
+        if scope.path_space is None:
+            raise PermissionError(f"会话作用域缺少 PathSpace，无法解析: {s}")
+        phys = scope.path_space.resolve(s, mode="write")
+        scope.path_space.assert_safe(phys, mode="write")
+        return str(phys)
+    if os.path.isabs(s) or s.startswith("~"):
+        p = os.path.realpath(os.path.expanduser(s))
+    else:
+        p = os.path.realpath(os.path.join(str(scope.scratch), s))
+    if not (scope.in_scratch(p) or scope.in_space(p)):
+        raise PermissionError(
+            f"路径越界: {rel} 不在会话目录或项目空间内；"
+            f"临时文件请用相对路径（落会话目录），项目文件请用 workspace:// 前缀"
+        )
+    return str(p)
+
+
+def _audit_workspace_write(phys_path: str, op: str) -> None:
+    """空间写入审计：路径位于空间根内时登记（无空间模式不登记）。"""
+    from cagent.runtime.session_scope import current_scope
+
+    scope = current_scope()
+    if scope is None or scope.space_root is None:
+        return
+    if not scope.in_space(phys_path):
+        return
+    if scope.record_write is None:
+        return
+    rel = os.path.relpath(phys_path, str(scope.space_root))
+    scope.record_write(rel, op)
+
+
+def _safe_write(rel: str) -> str:
+    """统一写路径闸门：优先会话作用域解析，无作用域回退 PathGuard。"""
+    phys = _scoped_resolve(rel)
+    if phys is not None:
+        return phys
+    return _guard.safe_write_path(rel)
+
+
 def apply_patch(patch: str, **kwargs) -> ToolResult:
     """应用补丁修改文件（Add/Update/Delete/Move）。"""
     if not patch or not patch.strip():
@@ -242,7 +297,7 @@ def _apply_action(action: _PatchAction, allow_overwrite: bool, allow_delete: boo
 
 
 def _do_add(action: _PatchAction, allow_overwrite: bool) -> str:
-    path = _guard.safe_write_path(action.path)
+    path = _safe_write(action.path)
     if os.path.exists(path) and not allow_overwrite:
         raise FileExistsError(f"文件已存在且不允许覆盖: {action.path}")
     parent = os.path.dirname(path)
@@ -251,11 +306,12 @@ def _do_add(action: _PatchAction, allow_overwrite: bool) -> str:
     content = "\n".join(action.added_lines)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
+    _audit_workspace_write(path, "add")
     return f"新增 {action.path}（{len(action.added_lines)} 行）"
 
 
 def _do_update(action: _PatchAction) -> str:
-    path = _guard.safe_write_path(action.path)
+    path = _safe_write(action.path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"文件不存在: {action.path}")
     with open(path, "r", encoding="utf-8") as f:
@@ -264,22 +320,24 @@ def _do_update(action: _PatchAction) -> str:
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(new_lines))
     change_count = sum(len(h.removed) + len(h.added) for h in action.hunks)
+    _audit_workspace_write(path, "update")
     return f"修改 {action.path}（{change_count} 处变更）"
 
 
 def _do_delete(action: _PatchAction, allow_delete: bool) -> str:
     if not allow_delete:
         raise PermissionError("配置不允许删除文件（allow_delete=False）")
-    path = _guard.safe_write_path(action.path)
+    path = _safe_write(action.path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"文件不存在: {action.path}")
     os.remove(path)
+    _audit_workspace_write(path, "delete")
     return f"删除 {action.path}"
 
 
 def _do_move(action: _PatchAction, allow_overwrite: bool) -> str:
-    old_path = _guard.safe_write_path(action.path)
-    new_path = _guard.safe_write_path(action.new_path)
+    old_path = _safe_write(action.path)
+    new_path = _safe_write(action.new_path)
     if not os.path.exists(old_path):
         raise FileNotFoundError(f"源文件不存在: {action.path}")
     if os.path.exists(new_path) and not allow_overwrite:
@@ -288,4 +346,5 @@ def _do_move(action: _PatchAction, allow_overwrite: bool) -> str:
     if parent:
         os.makedirs(parent, exist_ok=True)
     shutil.move(old_path, new_path)
+    _audit_workspace_write(new_path, "move")
     return f"移动 {action.path} -> {action.new_path}"

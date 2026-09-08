@@ -10,6 +10,7 @@ from ..tools.base import Tool, ToolResult
 from .tree import OperationTree, OperationNode
 from .shell_exec import ShellExecutor
 from .mcp_client import McpClientManager
+from .capability import CapabilityProbe
 
 
 class ToolGuideTool(Tool):
@@ -18,13 +19,14 @@ class ToolGuideTool(Tool):
     name = "tool_guide"
     description = (
         "查询工具操作的格式说明。传入 path 查看该路径下的操作列表或具体操作的格式。"
-        "例如：tool_guide(path='filesystem') 查看 filesystem 组下有哪些操作；"
-        "tool_guide(path='filesystem.apply_patch') 查看 apply_patch 的完整格式。"
+        "例如：tool_guide(path='shell') 查看 shell 组下有哪些操作；"
+        "不传参数则列出所有可用组。"
     )
     group = "default"
 
-    def __init__(self, tree: OperationTree):
+    def __init__(self, tree: OperationTree, capability: Optional[CapabilityProbe] = None):
         self._tree = tree
+        self._capability = capability
 
     def run(self, path: str = "") -> ToolResult:
         if not path or not path.strip():
@@ -50,11 +52,12 @@ class ToolGuideTool(Tool):
             )
 
         if node.is_branch:
-            # 中间节点：列出子节点
+            # 中间节点：列出子节点（标注不可用工具）
             lines = [f"「{node.name}」下有以下操作："]
             for name, child in node.children.items():
                 kind = "子组" if child.is_branch else "操作"
-                lines.append(f"  - {name}（{kind}）: {child.summary}")
+                suffix = self._availability_suffix(child)
+                lines.append(f"  - {name}（{kind}）: {child.summary}{suffix}")
             lines.append(
                 f"\n调用 tool_guide(path='{node.path}.子操作名') 查看具体格式。"
             )
@@ -62,6 +65,15 @@ class ToolGuideTool(Tool):
         else:
             # 叶子节点：返回完整格式
             detail = node.detail or node.summary or "（无详细说明）"
+            # CLI 可用性提示
+            if node.requires and self._capability is not None:
+                cli_name = node.requires.get("cli", "")
+                fallback_name = node.requires.get("fallback", "")
+                if cli_name and not self._capability.is_available(cli_name):
+                    if fallback_name:
+                        detail += f"\n注意：{cli_name} 不可用，将自动回退到 {fallback_name}。"
+                    else:
+                        detail += f"\n注意：{cli_name} 不可用。"
             # 附带参数提示
             if node.params:
                 param_lines = ["\n参数："]
@@ -89,6 +101,18 @@ class ToolGuideTool(Tool):
                     detail += "\n执行方式：框架代码执行"
                 detail += f"\n调用 run_tool(path='{node.path}', params={{...}}) 执行。"
             return ToolResult(ok=True, content=detail)
+
+    def _availability_suffix(self, node: OperationNode) -> str:
+        """为子节点生成可用性后缀标记。"""
+        if self._capability is None or not node.requires:
+            return ""
+        cli_name = node.requires.get("cli", "")
+        fallback_name = node.requires.get("fallback", "")
+        if cli_name and not self._capability.is_available(cli_name):
+            if fallback_name:
+                return f" [⚠ {cli_name} 不可用，将回退到 {fallback_name}]"
+            return f" [⚠ {cli_name} 不可用]"
+        return ""
 
     def schema(self) -> dict:
         return {
@@ -144,7 +168,18 @@ class RunToolTool(Tool):
     def set_mcp_manager(self, mcp: McpClientManager) -> None:
         self._mcp = mcp
 
-    def run(self, path: str, params: Optional[dict] = None) -> ToolResult:
+    def run(self, path: str = None, params: Optional[dict] = None) -> ToolResult:
+        # 友好提示：path 是必填参数
+        if path is None:
+            return ToolResult(
+                ok=False, content="",
+                error="缺少必填参数 'path'",
+                hint=(
+                    "run_tool 需要 'path' 参数指定操作路径。"
+                    "正确格式：run_tool(path='shell.sed', params={'file': '...', 'start_line': 1, 'end_line': 100})。"
+                    "先调用 tool_guide() 查看可用操作路径。"
+                ),
+            )
         node = self._tree.query(path)
         if node is None:
             return ToolResult(
@@ -220,18 +255,43 @@ class RunToolTool(Tool):
             return ToolResult(ok=False, content="", error="shell 执行器未配置")
         template = node.execute.get("command_template")
         if template:
-            # 模板模式：框架拼命令
-            command = self._shell.render_command(template, params)
+            # 模板模式：框架拼命令（L1 参数化渲染）
+            render_result = self._shell.render_command(template, params, node.params)
+            if not render_result.ok:
+                return render_result
+            command = render_result.content
             timeout = params.get("timeout")
             cwd = params.get("cwd")
         else:
-            # 完整命令模式：模型生成命令
+            # 完整命令模式：模型生成命令（仅 run_command 使用）
             command = params.get("command", "")
             timeout = params.get("timeout")
             cwd = params.get("cwd")
         if not command:
             return ToolResult(ok=False, content="", error="命令为空")
-        return self._shell.execute(command, timeout=timeout, cwd=cwd)
+        
+        result = self._shell.execute(command, timeout=timeout, cwd=cwd)
+        
+        # 回退逻辑：如果命令不可用（127 错误）且有 fallback_template
+        if not result.ok and result.error_kind == "TOOL_UNAVAILABLE" and node.requires:
+            fallback_template = node.execute.get("fallback_template")
+            if fallback_template:
+                # 渲染 fallback 模板
+                fallback_render = self._shell.render_command(
+                    fallback_template, params, node.params,
+                    extra_condition_templates=node.execute.get("fallback_condition_templates")
+                )
+                if fallback_render.ok:
+                    fallback_command = fallback_render.content
+                    fallback_result = self._shell.execute(
+                        fallback_command, timeout=timeout, cwd=cwd
+                    )
+                    # 如果 fallback 成功，在结果中提示
+                    if fallback_result.ok:
+                        fallback_result.content = f"[已回退到 {node.requires.get('fallback')}]\n" + fallback_result.content
+                    return fallback_result
+        
+        return result
 
     def _exec_mcp(self, node: OperationNode, params: dict) -> ToolResult:
         """MCP 协议执行模式：转发调用给 MCP 服务器。"""

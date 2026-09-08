@@ -22,6 +22,10 @@ tree:
       - 命令在工作目录下执行，不能越界
       - 黑名单命令会被拦截（如 rm -rf /、sudo）
       - stdout/stderr 自动截断
+      - 【重要】禁止使用 cat 整读（无法指定行范围，会被静默截断）。
+        读取文件请优先用下方 shell.sed（按行范围），
+        或 head -n N / tail -n N / awk 'NR>=A && NR<=B' / grep -n 等带行号的命令。
+        框架会走行号化视图输出（含续读指令）。
     execute:
       mode: shell
       command_template: null
@@ -42,88 +46,150 @@ tree:
   - name: rg
     summary: "按正则搜索文件内容（ripgrep）"
     detail: |
-      使用 ripgrep 搜索文件内容。模型生成完整的 rg 命令。
+      使用 ripgrep 搜索文件内容。
       框架负责安全执行（超时、目录限制、输出截断）。
 
       常用参数：
-      - --line-number / -n：显示行号
-      - -e <pattern>：正则表达式
-      - -g <glob>：文件名过滤（如 -g "*.py"）
-      - --type <type>：文件类型（如 --type py）
-      - --hidden：包含隐藏文件
-      - -i：忽略大小写
-      - -v：反向匹配
+      - pattern：正则表达式（必填）
+      - path：搜索路径（默认 .）
+      - type：文件类型（如 py、js）
+      - glob：文件名过滤（如 *.py）
+      - hidden：包含隐藏文件（默认 false）
+      - case_insensitive：忽略大小写（默认 false）
 
       示例：
-      rg --line-number -e "def main" -g "*.py" src/
-      rg -n "TODO" --type py
+      rg(pattern="def main", type="py", path="src/")
+      rg(pattern="TODO", glob="*.py")
 
       注意：如系统未安装 rg，会回退到 grep -rn。
+    requires:
+      cli: rg
+      fallback: grep
     execute:
       mode: shell
-      command_template: null
+      command_template: "rg {pattern} {type_opt}{glob_opt}{hidden_opt}{case_opt} {path}"
+      fallback_template: "grep -rn {case_grep_opt} {pattern} {path}"
+      fallback_condition_templates:
+        case_grep_opt: { param: "case_insensitive", format: "-i" }
     params:
-      command:
+      pattern:
         type: string
         required: true
-        description: "完整的 rg 命令"
+        description: "正则表达式"
+      path:
+        type: string
+        default: "."
+        description: "搜索路径（默认当前目录）"
+      type:
+        type: string
+        default: null
+        description: "文件类型（如 py、js）"
+      glob:
+        type: string
+        default: null
+        description: "文件名过滤（如 *.py）"
+      hidden:
+        type: boolean
+        default: false
+        description: "包含隐藏文件"
+      case_insensitive:
+        type: boolean
+        default: false
+        description: "忽略大小写"
 
   - name: fd
     summary: "按文件名模式查找文件（fd）"
     detail: |
-      使用 fd 查找文件。模型生成完整的 fd 命令。
+      使用 fd 查找文件。
       框架负责安全执行。
 
-      常用参数：
-      - --type / -t：类型（f=文件, d=目录, l=链接）
-      - --extension / -e：扩展名过滤
-      - --hidden / -H：包含隐藏文件
-      - --max-depth / -d：最大深度
+      参数：
+      - pattern：文件名模式（必填，正则表达式）
+      - path：搜索根目录（默认 .）
+      - type：类型过滤（f=文件, d=目录, l=链接）
+      - extension：扩展名过滤（如 py）
+      - hidden：包含隐藏文件（默认 false）
+      - max_depth：最大搜索深度（默认无限制）
 
       示例：
-      fd --type f --extension py src/
-      fd -t d "test" --max-depth 3
+      fd(pattern="test", type="f", extension="py")
+      fd(pattern="config", path="src/", max_depth=3)
 
       注意：如系统未安装 fd，会回退到 find。
+    requires:
+      cli: fd
+      fallback: find
     execute:
       mode: shell
-      command_template: null
+      command_template: "fd {pattern} {type_opt}{ext_opt}{hidden_opt}{depth_opt} {path}"
+      fallback_template: "find {path} -name '{pattern}' {type_find_opt}{ext_find_opt}{depth_find_opt}"
     params:
-      command:
+      pattern:
         type: string
         required: true
-        description: "完整的 fd 命令"
+        description: "文件名模式（正则）"
+      path:
+        type: string
+        default: "."
+        description: "搜索根目录"
+      type:
+        type: string
+        default: null
+        description: "类型（f/d/l）"
+      extension:
+        type: string
+        default: null
+        description: "扩展名（如 py）"
+      hidden:
+        type: boolean
+        default: false
+        description: "包含隐藏文件"
+      max_depth:
+        type: integer
+        default: null
+        description: "最大搜索深度"
 
   - name: sed
     summary: "查看文件指定行内容（sed）"
     detail: |
-      使用 sed 查看文件指定行范围的内容，带行号输出。
-      模型生成完整命令，框架负责安全执行。
+      使用 sed 查看文件指定行范围的内容。
 
-      常用用法：
-      - 查看全文（带行号）：sed -n '1,$p' <file> | cat -n
-      - 查看指定行范围：sed -n '10,30p' <file>
-      - 查看指定行范围（带行号）：sed -n '10,30=' <file>; sed -n '10,30p' <file>
-      - 查看前 N 行：sed -n '1,20p' <file>
-      - 查看后 N 行：sed -n '$-19,$p' <file>（部分系统不支持，可用 tail -n 20 <file>）
-      - 按模式匹配行：sed -n '/pattern/p' <file>
+      参数：
+      - file：文件路径（必填）
+      - start_line：起始行号（必填）
+      - end_line：结束行号（必填，$表示末尾）
+      - line_numbers：显示行号（默认 true）
 
       示例：
-      sed -n '15,50p' src/agent.py
-      sed -n '/def main/,/return/p' src/agent.py
+      sed(file="src/agent.py", start_line=10, end_line=30)
+      sed(file="README.md", start_line=1, end_line="$")
 
       注意：
-      - sed -n 'X,Yp' 输出第 X 到 Y 行（不含行号，可配合 cat -n 或 = 操作）
-      - sed -n 'Xp' 输出第 X 行
-      - 路径为相对路径，不能超出工作目录
+      - 路径不能超出工作目录
+      - end_line 可用 $ 表示文件末尾
+
+      【首选读取工具】读取文件请优先用 sed 而不是 cat：
+      - cat 无法指定行范围，大文件必然被静默截断 → 模型看不到全貌会自信乱改
+      - sed 按行范围精确读取，框架会走行号化视图（=== <file> | ... | === 头部契约），
+        输出 [read] lines A-B of N + 续读指令（grep -n 定位 / sed -n 续读）
+      - 推荐流程：先 grep -n 'pattern' <file> 定位目标行号，
+        再 sed(file, start_line, end_line) 点读目标区段
     execute:
       mode: shell
-      command_template: null
+      command_template: "sed -n '{start_line},{end_line}p' {file}"
     params:
-      command:
+      file:
         type: string
         required: true
-        description: "完整的 sed 命令"
+        description: "文件路径"
+      start_line:
+        type: integer
+        required: true
+        description: "起始行号"
+      end_line:
+        type: string
+        required: true
+        description: "结束行号（数字或 $）"
 
   - name: git
     summary: "Git 操作子组"
@@ -132,97 +198,133 @@ tree:
         summary: "查看 Git 状态"
         detail: |
           执行 git status 查看工作区状态。
-          模型生成完整命令。
         execute:
           mode: shell
-          command_template: null
-        params:
-          command:
-            type: string
-            required: true
-            description: "完整的 git status 命令"
+          command_template: "git status"
+        params: {}
 
       - name: diff
         summary: "查看 Git 差异"
         detail: |
           执行 git diff 查看差异。
-          模型生成完整命令。
+
+          参数：
+          - staged：显示已暂存的差异（默认 false）
+          - pathspec：指定文件路径（可选）
         execute:
           mode: shell
-          command_template: null
+          command_template: "git diff {staged_opt} {pathspec}"
         params:
-          command:
+          staged:
+            type: boolean
+            default: false
+            description: "显示已暂存的差异"
+          pathspec:
             type: string
-            required: true
-            description: "完整的 git diff 命令"
+            default: null
+            description: "指定文件路径"
 
       - name: log
         summary: "查看 Git 日志"
         detail: |
           执行 git log 查看提交历史。
-          模型生成完整命令。
+
+          参数：
+          - oneline：单行格式（默认 true）
+          - n：显示条数（默认 10）
+          - author：作者过滤（可选）
+          - since：时间范围（如 "1 week ago"）
 
           示例：
-          git log --oneline -10
-          git log --author="张三" --since="1 week ago"
+          git log(n=20, author="张三")
+          git log(since="2024-01-01")
         execute:
           mode: shell
-          command_template: null
+          command_template: "git log {oneline_opt} -n {n} {author_opt}{since_opt}"
         params:
-          command:
+          oneline:
+            type: boolean
+            default: true
+            description: "单行格式"
+          n:
+            type: integer
+            default: 10
+            description: "显示条数"
+          author:
             type: string
-            required: true
-            description: "完整的 git log 命令"
+            default: null
+            description: "作者过滤"
+          since:
+            type: string
+            default: null
+            description: "时间范围"
 
       - name: add
         summary: "暂存文件"
         detail: |
           执行 git add 暂存文件。
-          模型生成完整命令。
+
+          参数：
+          - pathspec：文件路径或 .（必填）
 
           示例：
-          git add .
-          git add src/agent.py
+          git add(pathspec=".")
+          git add(pathspec="src/agent.py")
         execute:
           mode: shell
-          command_template: null
+          command_template: "git add {pathspec}"
         params:
-          command:
+          pathspec:
             type: string
             required: true
-            description: "完整的 git add 命令"
+            description: "文件路径或 ."
 
       - name: commit
         summary: "提交代码"
         detail: |
           执行 git commit 提交。
-          模型生成完整命令。
+
+          参数：
+          - message：提交信息（必填）
+          - all：提交所有已跟踪文件的修改（默认 false）
 
           示例：
-          git commit -m "fix: 修复登录bug"
-          git commit -am "feat: 新增搜索功能"
+          git commit(message="fix: 修复登录bug")
+          git commit(message="feat: 新增搜索功能", all=true)
         execute:
           mode: shell
-          command_template: null
+          command_template: "git commit {all_opt} -m \"{message}\""
         params:
-          command:
+          message:
             type: string
             required: true
-            description: "完整的 git commit 命令"
+            description: "提交信息"
+          all:
+            type: boolean
+            default: false
+            description: "提交所有修改"
 
       - name: push
         summary: "推送到远程"
         detail: |
           执行 git push 推送到远程仓库。
-          模型生成完整命令。
+
+          参数：
+          - remote：远程仓库名（默认 origin）
+          - branch：分支名（默认当前分支）
 
           示例：
-          git push origin main
+          git push()
+          git push(remote="upstream", branch="main")
         execute:
           mode: shell
-          command_template: null
+          command_template: "git push {remote} {branch}"
         params:
-          command:
+          remote:
             type: string
-            required: true
-            description: "完整的 git push 命令"
+            default: "origin"
+            description: "远程仓库名"
+          branch:
+            type: string
+            default: null
+            description: "分支名（默认当前分支）"

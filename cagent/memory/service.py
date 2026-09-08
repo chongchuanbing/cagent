@@ -104,3 +104,31 @@ class MemoryService:
     def remember(self, content: str, tags: Optional[dict] = None) -> MemoryRecord:
         """用户显式指定的记忆：清洗后直通老年代（不受 enabled 限制，尊重用户显式意图）。"""
         return self.tenuring.pin(sanitize_text(content), tags)
+
+    # ---------- L6: 环境事实沉淀 ----------
+
+    def absorb_env_facts(
+        self,
+        failure_ledger,
+        capability_probe,
+        session_id: Optional[str] = None,
+    ) -> List[MemoryRecord]:
+        """L6: 将失败账本中的环境事实沉淀到长期记忆。
+
+        - 工具不可用（TOOL_UNAVAILABLE）的事实以 pinned 方式直通老年代
+        - 下次 recall 时能带出这些环境限制，避免重复踩坑
+        """
+        if failure_ledger is None:
+            return []
+
+        records = []
+        for tool_name, error_kind in failure_ledger._failure_reasons.items():
+            if error_kind == "TOOL_UNAVAILABLE":
+                content = f"本机不可用: {tool_name}（请避免依赖该工具，或改用替代方案）"
+                try:
+                    record = self.remember(content, tags={"kind": "env_fact", "tool": tool_name})
+                    records.append(record)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        return records

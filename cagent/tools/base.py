@@ -12,6 +12,8 @@ class ToolResult:
     ok: bool
     content: str
     error: Optional[str] = None
+    error_kind: Optional[str] = None   # "PARAM_MISSING" | "TOOL_UNAVAILABLE" | "SANDBOX" | "TIMEOUT" | "EXEC_ERROR"
+    hint: Optional[str] = None          # 给 LLM 的可执行建议
 
 
 class Tool(ABC):
@@ -19,11 +21,14 @@ class Tool(ABC):
 
     group 为工具所属分组（命名空间），用于按启用组裁剪工具面；
     default 组始终视为启用。
+    requires 为工具依赖声明，格式如 {"cli": "fd", "fallback": "find"}，
+    用于 L3 工具面裁剪（基于环境探测结果过滤不可用工具）。
     """
 
     name: str = ""
     description: str = ""
     group: str = "default"
+    requires: Optional[dict] = None  # L3 环境裁剪：{"cli": "fd", "fallback": "find"}
 
     @abstractmethod
     def run(self, **kwargs) -> ToolResult:

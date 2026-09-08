@@ -18,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
-from .schema import AgentConfig, MemoryConfig, ModelConfig
+from .schema import AgentConfig, MemoryConfig, ModelConfig, PathSpaceConfig
 from ..llm.base import LLMConfig
 from ..prompts import (
     HISTORY_SUMMARIZE_SYSTEM_PROMPT,
@@ -29,7 +29,6 @@ from ..prompts import (
     REACT_SYSTEM_TEMPLATE,
     SUMMARIZE_SYSTEM_PROMPT,
 )
-from ..utils.config import Config as RuntimeConfig
 
 
 # 内置默认提示词，未被配置覆盖时使用
@@ -49,12 +48,13 @@ class ConfigProvider:
 
     def __init__(self, path: str = "config/agent.yaml", watch: bool = True, data_dir: Optional[str] = None):
         self.path = path
-        self.data_dir = data_dir or RuntimeConfig().data_dir
+        # 显式传入的 data_dir 优先级最高（覆盖配置里的 paths.data_dir）
+        self._data_dir_override = data_dir
         self._lock = threading.RLock()
         self._cfg = AgentConfig()
         self._mtime = -1
         self._stop = False
-        self._load()
+        self._load()  # 内部按 paths.data_dir 解析出 self.data_dir
         if watch:
             self._thread = threading.Thread(target=self._watch_loop, daemon=True)
             self._thread.start()
@@ -91,6 +91,8 @@ class ConfigProvider:
             if data.get("tools") is None:
                 data["tools"] = {}
             self._cfg = AgentConfig(**data)
+            # data_dir 唯一来源：显式覆盖 > 配置 paths.data_dir（热加载后即生效）
+            self.data_dir = self._data_dir_override or self._cfg.paths.data_dir
             self._mtime = os.path.getmtime(self.path) if os.path.exists(self.path) else -1
 
     def _maybe_reload(self) -> None:
@@ -139,6 +141,50 @@ class ConfigProvider:
             max_tokens=m.max_tokens,
             data_dir=self.data_dir,
         )
+
+    def build_path_space(
+        self,
+        base_dir: Optional[str] = None,
+        plugins_dir: Optional[str] = None,
+        config_dir: Optional[str] = None,
+    ):
+        """按 `paths` 配置构造 PathSpace —— 框架内唯一推荐的路径构造入口。
+
+        base_dir / plugins_dir / config_dir 为端上显式覆盖（如 CLI 由 __file__ 推出
+        插件目录），未传时取配置里的 paths.* 。
+        """
+        from pathlib import Path
+
+        from ..runtime.paths import Mount, PathSpace
+
+        self._maybe_reload()
+        p: PathSpaceConfig = self._cfg.paths
+        base = Path(base_dir or p.base_dir or os.getcwd())
+        space = PathSpace.build_default(
+            base,
+            work_dir=p.work_dir,
+            data_dir=self.data_dir,
+            plugins_dir=plugins_dir or p.plugins_dir,
+            config_dir=config_dir or p.config_dir,
+            allow_paths=tuple(p.allow_paths),
+            allow_symlink_targets=tuple(p.allow_symlink_targets),
+        )
+        # data:// 是否对模型可见由配置决定（默认隐藏，避免模型误把 .data 当可写工作区）
+        dm = space.mounts.get("data")
+        if dm is not None and dm.expose_to_llm != p.expose_data_to_llm:
+            space = space.with_mount(
+                Mount(
+                    dm.name,
+                    dm.physical,
+                    expose_to_llm=p.expose_data_to_llm,
+                    sandbox=dm.sandbox,
+                    modes=dm.modes,
+                )
+            )
+        # 注：skills://<name>/... 由 read_skill_file 经 SkillDefinition.resolve_file 承接，
+        # 不在 PathSpace 注册挂载点，避免与「mount 名即 scheme」的解析规则冲突；
+        # 路径速查卡里 skills:// 作为框架级逻辑约定直接说明。
+        return space
 
     def get_prompt(self, key: str, default: Optional[str] = None, **kwargs) -> str:
         """返回提示词模板；带 kwargs 时按占位符渲染。

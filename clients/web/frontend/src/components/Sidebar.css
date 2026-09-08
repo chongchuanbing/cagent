@@ -1,0 +1,12 @@
+.sidebar {
+  width: 268px;
+  min-width: 268px;
+  height: 100%;
+  background-color: #f8f9fa;
+  border-right: 1px solid #e5e7eb;
+  display: flex;
+  flex-direction: column;
+  font-size: 14px;
+  color: #1f2937;
+  overflow: hidden;
+}

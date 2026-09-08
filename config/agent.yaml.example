@@ -66,3 +66,15 @@ memory:
       sensitivity:
         values: [public, private]
         required: false
+
+# 路径空间（PathSpace）：框架内所有根目录的唯一来源
+# 相对路径均基于 base_dir 解析；留空则取端上注入的当前工作目录
+# paths:
+#   base_dir: null              # 基准目录；null = 端上注入（CLI 取 os.getcwd()）
+#   work_dir: null              # 工具操作沙箱根（模型看到 workspace://）；null = base_dir
+#   data_dir: .data             # 框架私有数据存储（默认对模型隐藏）
+#   plugins_dir: null           # 插件目录；null = 由端上按包位置推导
+#   config_dir: null            # 配置目录；null = 配置文件所在目录
+#   expose_data_to_llm: false   # 是否把 data:// 暴露给模型（慎用）
+#   allow_paths: []             # 受信外挂区（绝对前缀），允许合法越界访问
+#   allow_symlink_targets: []   # 允许 symlink 指向的目标前缀

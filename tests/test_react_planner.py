@@ -227,7 +227,7 @@ def _three_step_plan() -> LLMResponse:
 
 
 def test_react_unconverged_falls_back_to_summary():
-    """迭代耗尽未收敛：LLM 总结已有轨迹作为本步骤结果，而非直接失败。"""
+    """迭代耗尽未收敛：LLM 总结已有轨迹保留在 output，但步骤标记失败（触发 replan）。"""
     tool_call = LLMResponse(
         content="我需要计算结果",
         tool_calls=[
@@ -246,9 +246,10 @@ def test_react_unconverged_falls_back_to_summary():
     engine = ReActEngine(llm, reg, max_iterations=1)
     result = engine.run(Step(id="s1", description="计算 3+5"))
 
-    # 总结成为 step 执行结果，且标记成功（避免触发 replan 循环）
-    assert result.success
+    # 未收敛 ≠ 完成：总结只是阶段性说明，success=False 由上层触发 replan
+    assert not result.success
     assert "阶段性结论" in result.output
+    assert "未收敛" in (result.error or "")
     # 轨迹记录了未收敛标记
     finals = [t for t in engine.last_trace if "final" in t]
     assert finals and finals[0].get("unconverged") is True

@@ -22,7 +22,8 @@
 | LLM 接入 | OpenAI 兼容 SDK | `llm/` 抽象层，默认 `openai`，可扩展其他供应商 |
 | HTTP | `httpx` | 供应商请求与内置工具联网 |
 | 工具系统 | 自研装饰器 `@tool` | 普通函数一键注册为 `Tool` |
-| 配置 | `pydantic` / `yaml` | `config/`（端上可配置文件 + 热加载）；`utils/config.py` 仅存运行期常量（data_dir 等） |
+| 配置 | `pydantic` / `yaml` | `config/`（端上可配置文件 + 热加载）；路径配置集中在 `config/schema.py` 的 `PathSpaceConfig`（`paths` 段） |
+| 路径管理 | `pathlib` | `runtime/paths.py` 的 `PathSpace`（逻辑 `scheme://` 与物理挂载点分离，唯一安全闸门）；由 `ConfigProvider.build_path_space()` 构造，详见 `docs/path-management-design.md` |
 | 日志 | 标准库 `logging` | `utils/logging.py` 分级（loop / react / tool） |
 | 测试 | `pytest` | `tests/` 下 unit + integration |
 
@@ -80,8 +81,21 @@ cagent/
 │   └── react_prompt.py        # 单步 ReAct 提示（含工具描述）
 │
 ├── utils/
-│   ├── config.py              # 配置加载
-│   └── logging.py             # 统一日志
+│   ├── logging.py             # 统一日志
+│   └── text.py                # sanitize_text / tokenize
+│
+├── runtime/                   # ★ 运行时基础设施
+│   ├── paths.py               # PathSpace / Mount（路径空间，详见 docs/path-management-design.md）
+│   ├── sandbox/               # ★ 系统级沙箱（详见 docs/design/sandbox-design.md）
+│   │   ├── base.py            # ExecutionBackend 抽象 / LocalBackend / run_argv（进程组管理）
+│   │   ├── profile_gen.py     # SandboxRules：PathSpace → 平台无关规则（单一事实源编译器）
+│   │   ├── seatbelt.py        # macOS sandbox-exec 后端
+│   │   ├── bwrap.py           # Linux bubblewrap 后端
+│   │   └── user.py            # 低权限用户降权后端（实验性）
+│   └── session_scope.py       # 会话路径作用域（ContextVar）：run 期间工具感知 scratch/空间根；
+│                               # 无空间时 workspace:// 即会话 scratch；有空间（--space / paths.space_dir）
+│                               # 时 workspace:// 挂空间根——结构化工具写入须显式 scheme 并登记
+│                               # meta.workspace_writes 审计，shell cwd 钉 scratch、拦截重定向/cd 漂移写空间
 │
 ├── storage/                   # 存储抽象层（本地文件）
 │   ├── __init__.py            # get_storage / SessionRecorder
@@ -91,8 +105,8 @@ cagent/
 │
 └── config/                    # 端上配置与热加载
     ├── __init__.py
-    ├── schema.py              # AgentConfig / ModelConfig
-    └── provider.py            # ConfigProvider（yaml + 保存即生效）
+    ├── schema.py              # AgentConfig / ModelConfig / PathSpaceConfig
+    └── provider.py            # ConfigProvider（yaml + 保存即生效）+ build_path_space()
 ```
 
 > 顶层另含 `pyproject.toml`、`README.md`、`tests/`、`examples/`、`docs/`。
@@ -186,7 +200,7 @@ run 开始
 
 ## 7. 数据存储（`.data`）
 
-存储使用**本地文件存储**，默认根目录为当前项目下的 `.data/`（可通过 `Config.data_dir` 覆盖）。所有读写经由 `cagent.storage` 模块，便于后续替换为其他后端。
+存储使用**本地文件存储**，默认根目录为当前项目下的 `.data/`（可通过配置 `paths.data_dir` 覆盖）。所有读写经由 `cagent.storage` 模块，便于后续替换为其他后端。
 
 ```
 .data/

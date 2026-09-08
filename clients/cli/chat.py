@@ -26,10 +26,24 @@ def cmd_chat(args) -> int:
     agent, cfg = _build_agent(args.config, emitter=emitter)
 
     sid = args.session_id or uuid.uuid4().hex
-    resume = False  # 首轮不 resume，后续轮自动 resume
+    # 显式指定 --session-id 视为续接既有会话：首轮即加载其历史上下文；
+    # 若该 session 无 trace（新 ID），load_history 返回空，等价于全新会话
+    resume = args.session_id is not None
 
     print(f"cagent 交互式会话已启动")
     print(f"会话 ID: {sid}")
+    space_dir = getattr(args, "space", None)
+    if space_dir:
+        print(f"项目空间: {space_dir}（修改项目文件用 workspace:// 前缀；临时文件落会话目录）")
+    if resume:
+        from cagent.storage import SessionRecorder
+
+        prior = SessionRecorder(agent.storage, sid).load_history()
+        if prior:
+            last = prior[-1]
+            print(f"已加载该会话历史：目标「{last['description'][:50]}」→ {last['output'][:50]}")
+        else:
+            print(f"（会话 {sid} 无历史记录，将作为新会话开始）")
     print(f"输入 /exit 退出，/history 查看历史上下文，/sessions 列出所有会话")
     print()
 
@@ -65,7 +79,7 @@ def cmd_chat(args) -> int:
 
         # 执行 agent
         try:
-            agent.run(goal, session_id=sid, resume=resume)
+            agent.run(goal, session_id=sid, resume=resume, space_dir=space_dir)
         except Exception as e:
             print(f"执行错误: {e}")
 

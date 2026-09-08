@@ -332,12 +332,13 @@ class TestShellExecutor:
 
     def test_render_command(self):
         se = ShellExecutor({"work_dir": "."})
-        rendered = se.render_command(
+        result = se.render_command(
             "git {add_all_opt} commit -m '{message}'",
             {"message": "fix bug", "add_all_opt": "add . &&", "add_all": True},
         )
-        assert "add . &&" in rendered
-        assert "fix bug" in rendered
+        assert result.ok
+        assert "add . &&" in result.content
+        assert "fix bug" in result.content
 
 
 # ── PluginManager 测试 ─────────────────────────────────────

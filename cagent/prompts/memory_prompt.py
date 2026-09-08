@@ -43,7 +43,10 @@ def build_tags_instruction(mode: str, schema: dict, implicit_max_tags: int) -> s
 
 
 def build_memory_extract_user_prompt(goal: str, history: List[dict], answer: str) -> str:
-    """构造提取的用户提示：总目标 + 各步骤结论与工具问答 + 最终答案。"""
+    """构造提取的用户提示：总目标 + 各步骤结论 + 最终答案。
+
+    只传入步骤的交付结论，中间过程不进上下文。
+    """
     lines = [f"任务目标：{goal}", "", "执行过程素材："]
     for h in history:
         if not isinstance(h, dict):
@@ -54,8 +57,6 @@ def build_memory_extract_user_prompt(goal: str, history: List[dict], answer: str
             continue
         mark = "成功" if h.get("success", True) else "失败"
         lines.append(f"- 步骤[{h.get('step_id', '?')}]（{mark}）{h.get('description', '')} → {h.get('output', '')}")
-        for ob in h.get("observations") or []:
-            lines.append(f"    · 工具 {ob.get('tool')} 参数 {ob.get('args')} → 返回：{ob.get('result')}")
     lines.append("")
     lines.append(f"最终答案：{answer}")
     return "\n".join(lines)

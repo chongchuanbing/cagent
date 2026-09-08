@@ -20,7 +20,8 @@ class OperationNode:
     detail: Optional[str] = None     # 完整说明（叶子层披露用）
     children: Dict[str, "OperationNode"] = field(default_factory=dict)
     params: Dict[str, dict] = field(default_factory=dict)
-    execute: Optional[dict] = None   # {mode: "executor"|"shell", handler/template}
+    execute: Optional[dict] = None   # {mode: "executor"|"shell", handler/template, fallback_template: "..."}
+    requires: Optional[dict] = None  # CLI 依赖声明，如 {cli: "fd", fallback: "find"}
 
     @property
     def is_leaf(self) -> bool:
@@ -75,6 +76,7 @@ class OperationTree:
             children=children,
             params=data.get("params", {}),
             execute=data.get("execute"),
+            requires=data.get("requires"),
         )
 
     def query(self, path: str) -> Optional[OperationNode]:

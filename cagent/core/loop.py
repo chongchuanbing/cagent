@@ -141,6 +141,18 @@ class AgentLoop:
                 memory.absorb(goal, history, answer, session_id=session_id)
             except Exception:  # noqa: BLE001 —— 记忆沉淀失败不影响主流程
                 pass
+
+            # L6: 将失败账本中的环境事实沉淀到长期记忆
+            if self.executor.react_engine._failure_ledger is not None:
+                try:
+                    memory.absorb_env_facts(
+                        self.executor.react_engine._failure_ledger,
+                        None,
+                        session_id=session_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
         return answer
 
     def _should_terminate(self, plan: Plan) -> bool:
@@ -151,23 +163,29 @@ class AgentLoop:
     def _history_entry(self, step: Step, result: StepResult, trace: List[dict]) -> dict:
         """把单个 step 的执行结果压缩为可注入后续步骤上下文的记录。
 
-        observations 完整保留工具问答（ask_user 的用户回答就在这里），
-        单条观察按 observation_max_chars 截断。
+        保留 step 的交付结论（output）和工具观察（截断后）。完整轨迹保留在
+        trace.jsonl 用于审计/调试。
         """
-        observations = [
-            {
-                "tool": e["action"].tool_name,
-                "args": e["action"].args,
-                "result": self._clip_observation(e["observation"]),
-            }
-            for e in trace if "action" in e
-        ]
+        # 提取工具观察并截断
+        observations = []
+        for entry in trace:
+            if "observation" in entry:
+                tool_name = entry.get("action", {}).get("tool_name", "unknown")
+                obs = entry["observation"]
+                clipped = self._clip_observation(obs)
+                observations.append(f"{tool_name}: {clipped}")
+        
+        output_parts = []
+        if result.output:
+            output_parts.append(result.output)
+        if observations:
+            output_parts.append("工具观察: " + "; ".join(observations))
+        
         return {
             "step_id": step.id,
             "description": step.description,
             "success": result.success,
-            "output": result.output or result.error or "",
-            "observations": observations,
+            "output": " | ".join(output_parts) if output_parts else (result.error or ""),
         }
 
     # ---------- history 窗口管理 ----------
@@ -179,7 +197,74 @@ class AgentLoop:
         return default
 
     def _clip_observation(self, text: str) -> str:
-        """按 observation_max_chars 截断单条工具观察，防止大结果撑爆上下文。"""
+        """按 observation_max_chars 截断单条工具观察，防止大结果撑爆上下文。
+
+        读取类输出（shell_exec 行号化视图，以 `=== <path> | ` 开头）走更大阈值
+        read_max_chars，且截断时**保留头部契约**（位置/总行数/续读指令不被吞）。
+        结构化截断（shell_exec 非读取类，以 `[元信息]` 开头）走中等阈值
+        observation_max_chars * 2，且截断时**保留元信息头和截断建议**。
+        普通观察仍走 observation_max_chars（默认 500）。
+        """
+        # 读取类识别：=== <path> | ... === 头部契约
+        stripped = text.lstrip()
+        read_marker = "=== "
+        if stripped.startswith(read_marker) and " | " in stripped[:80]:
+            max_chars = self._cfg_value("read_max_chars", 30000)
+            if max_chars <= 0 or len(text) <= max_chars:
+                return text
+            # 保留头部契约：找到 [read] 行作为正文分界
+            marker = "\n[read] "
+            idx = text.find(marker)
+            if idx > 0:
+                # 头部结束位置：[read] 行末尾
+                nl_after = text.find("\n", idx + 1)
+                if nl_after > 0:
+                    header = text[: nl_after + 1]
+                    body_budget = max_chars - len(header) - 50
+                    if body_budget > 0:
+                        body = text[
+                            nl_after + 1 : nl_after + 1 + body_budget
+                        ]
+                        return (
+                            header + body
+                            + f"\n…（已截断，原 {len(text)} 字符，"
+                            "请用 sed -n 'A,Bp' <file> 续读）"
+                        )
+            # 找不到 [read] 标记（不正常的视图），粗暴切
+            return text[:max_chars] + f"…（已截断，原 {len(text)} 字符）"
+
+        # 结构化截断识别：[元信息] 开头（非读取类命令的结构化截断）
+        meta_marker = "[元信息]"
+        if stripped.startswith(meta_marker):
+            # 结构化截断走中等阈值：observation_max_chars * 2
+            max_chars = self._cfg_value("observation_max_chars", 500) * 2
+            if max_chars <= 0 or len(text) <= max_chars:
+                return text
+            # 找到元信息头结束位置（第一个 "---"）
+            meta_end = text.find("\n---\n")
+            if meta_end > 0:
+                meta_header = text[: meta_end + 5]  # 包含 \n---\n
+                # 找到截断建议开始位置（最后一个 "---"）
+                footer_start = text.rfind("\n---\n")
+                if footer_start > meta_end:
+                    footer = text[footer_start:]
+                    # 元信息头 + 正文（截断）+ 截断建议
+                    body_budget = max_chars - len(meta_header) - len(footer) - 50
+                    if body_budget > 0:
+                        body = text[meta_end + 5 : footer_start]
+                        if len(body) > body_budget:
+                            body = body[:body_budget] + "\n...（正文截断）"
+                        return meta_header + body + footer
+                else:
+                    # 没有截断建议，只有元信息头
+                    body_budget = max_chars - len(meta_header) - 50
+                    if body_budget > 0:
+                        body = text[meta_end + 5 : meta_end + 5 + body_budget]
+                        return meta_header + body + "\n...（已截断）"
+            # 找不到元信息头结构，粗暴切
+            return text[:max_chars] + f"…（已截断，原 {len(text)} 字符）"
+
+        # 普通观察
         max_chars = self._cfg_value("observation_max_chars", 500)
         if max_chars <= 0 or len(text) <= max_chars:
             return text
@@ -191,7 +276,6 @@ class AgentLoop:
         超窗条目按 history_summarize 配置处理：
         - True（默认）：与既有摘要一起压缩为一条滚动摘要，置顶保留关键信息；
         - False：直接丢弃（trace.jsonl 已完整落盘，不丢数据）。
-        含 ask_user 用户反馈的条目最后淘汰（用户输入是最高价值信息）。
         """
         window = self._cfg_value("history_window", 10)
         if window <= 0:
@@ -200,21 +284,13 @@ class AgentLoop:
         old_summary = next((h["summary"] for h in history if "summary" in h), "")
         evicted: List[dict] = []
         while len(entries) > window:
-            # 优先淘汰最旧的非用户反馈条目；全是用户反馈时按最旧淘汰
-            idx = next(
-                (i for i, h in enumerate(entries) if not self._has_user_feedback(h)), 0
-            )
-            evicted.append(entries.pop(idx))
+            evicted.append(entries.pop(0))
         if not evicted:
             return history
         if not self._cfg_value("history_summarize", True):
             return entries
         summary = self._rollup_summary(old_summary, evicted)
         return ([{"summary": summary}] if summary else []) + entries
-
-    @staticmethod
-    def _has_user_feedback(entry: dict) -> bool:
-        return any(ob.get("tool") == "ask_user" for ob in entry.get("observations", []))
 
     def _rollup_summary(self, old_summary: str, evicted: List[dict]) -> str:
         """把被挤出窗口的条目（连同旧摘要）压缩为一条滚动摘要。
@@ -227,12 +303,6 @@ class AgentLoop:
             parts.append(f"此前摘要：{old_summary}")
         for h in evicted:
             line = f"步骤[{h['step_id']}]（{'成功' if h.get('success') else '失败'}）{h.get('description', '')} → {h.get('output', '')}"
-            obs = "；".join(
-                f"{o['tool']}({o['args']})→{self._clip_observation(o['result'])}"
-                for o in h.get("observations", [])
-            )
-            if obs:
-                line += f"（{obs}）"
             parts.append(line)
         digest = "\n".join(parts)
 

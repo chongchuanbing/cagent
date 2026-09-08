@@ -68,24 +68,28 @@ def build_adjust_prompt(
     completed_step: Step,
     history: List[dict],
 ) -> str:
-    """构造增量调整提示：给出当前 plan 状态 + 本步结果，要求输出调整 JSON。"""
+    """构造增量调整提示：给出当前 plan 状态 + 本步结果，要求输出调整 JSON。
+
+    只传入已完成步骤的交付结论，中间过程不进上下文。
+    """
     steps_desc = "\n".join(
         f"- {s.id}: {s.description} [{s.status.value}]"
         + (f" → {s.result.output[:200]}" if s.result and s.result.output else "")
         for s in plan.steps
     )
-    # 本步观察摘要
-    observations = []
+    # 已完成步骤的结论摘要
+    step_outputs = []
     for h in history:
-        for obs in h.get("observations", []):
-            observations.append(f"  · {obs.get('tool', '')}: {obs.get('result', '')[:150]}")
-    obs_text = "\n".join(observations[-5:]) if observations else "（无）"
+        if "step_id" in h:
+            mark = "成功" if h.get("success", True) else "失败"
+            step_outputs.append(f"  · [{mark}] {h.get('output', '')[:150]}")
+    outputs_text = "\n".join(step_outputs[-5:]) if step_outputs else "（无）"
 
     return (
         f"当前目标：{plan.goal}\n"
         f"当前计划状态：\n{steps_desc}\n\n"
         f"刚完成的步骤：{completed_step.id} - {completed_step.description}\n"
         f"步骤结果：{completed_step.result.output[:300] if completed_step.result else '（无）'}\n"
-        f"近期观察：\n{obs_text}\n\n"
+        f"已完成步骤结论：\n{outputs_text}\n\n"
         f"请评估是否需要调整未执行（pending）的步骤。"
     )
