@@ -54,10 +54,12 @@ class OpenAIClient(LLMClient):
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
         )
-        choice = resp.choices[0].message
+        choice = resp.choices[0]
+        msg = choice.message
         return LLMResponse(
-            content=choice.content or "",
-            tool_calls=self._normalize_tool_calls(getattr(choice, "tool_calls", None)),
+            content=msg.content or "",
+            tool_calls=self._normalize_tool_calls(getattr(msg, "tool_calls", None)),
+            finish_reason=getattr(choice, "finish_reason", None),
             usage=resp.usage.model_dump() if resp.usage else None,
             raw=resp,
         )
@@ -70,10 +72,12 @@ class OpenAIClient(LLMClient):
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
         )
-        choice = resp.choices[0].message
+        choice = resp.choices[0]
+        msg = choice.message
         return LLMResponse(
-            content=choice.content or "",
-            tool_calls=self._normalize_tool_calls(getattr(choice, "tool_calls", None)),
+            content=msg.content or "",
+            tool_calls=self._normalize_tool_calls(getattr(msg, "tool_calls", None)),
+            finish_reason=getattr(choice, "finish_reason", None),
             usage=resp.usage.model_dump() if resp.usage else None,
             raw=resp,
         )

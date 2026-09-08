@@ -17,6 +17,7 @@ from ..config.provider import ConfigProvider
 from ..events import EventEmitter, EventType
 from ..plugins.capability import CapabilityProbe
 from .failure_ledger import FailureLedger
+from .doom_loop import DoomLoopDetector
 
 
 class ReActEngine:
@@ -32,6 +33,7 @@ class ReActEngine:
         capability: Optional[CapabilityProbe] = None,
         failure_ledger: Optional[FailureLedger] = None,
         path_space=None,
+        doom_loop_detector: Optional[DoomLoopDetector] = None,
     ):
         self.llm = llm
         self.tools = tools
@@ -44,6 +46,8 @@ class ReActEngine:
         self.last_trace: List[dict] = []
         # L5: 失败账本（跨 step 持续记录，在 Agent 级别共享）
         self._failure_ledger = failure_ledger or FailureLedger()
+        # 死循环检测器（每个 step 内独立，run 开头 reset）
+        self._doom_detector = doom_loop_detector or DoomLoopDetector()
 
     def _select_tools(self, step: Step, goal: Optional[str]) -> List[Tool]:
         """按配置确定本 step 注入的工具集。
@@ -93,6 +97,45 @@ class ReActEngine:
 
         return filtered
 
+    def _should_terminate_loop(self, resp) -> tuple:
+        """基于 API 原生信号（finish_reason）判定是否应终止 ReAct 循环。
+
+        对标 AgentScope 的 _next_action() 三态控制和 Claude Code 的 stop_reason 判定：
+        - 有 tool_calls → 继续循环
+        - 无 tool_calls + finish_reason=stop/end_turn → 模型主动完成，终止
+        - 无 tool_calls + finish_reason=length → token 截断，非真正完成
+        - 无 tool_calls + finish_reason 为空 → 兼容旧行为
+
+        Returns:
+            (should_terminate: bool, reason: str)
+            reason 取值：
+            - "continue": 继续循环
+            - "model_done": 模型主动完成（finish_reason=stop/end_turn）
+            - "truncated": token 用完被截断（finish_reason=length）
+            - "filtered": 内容被过滤
+            - "compat_done": 兼容模式（API 未返回 finish_reason 但无 tool_calls）
+        """
+        # 有工具调用 → 继续循环
+        if resp.tool_calls:
+            return False, "continue"
+
+        # 无工具调用，按 finish_reason 细分
+        fr = (resp.finish_reason or "").lower()
+
+        if fr in ("stop", "end_turn"):
+            # API 明确告知模型完成了
+            return True, "model_done"
+
+        if fr == "length":
+            # token 用完 → 回复被截断，不是真正的完成
+            return True, "truncated"
+
+        if fr == "content_filter":
+            return True, "filtered"
+
+        # finish_reason 为空或未知 → 兼容旧行为
+        return True, "compat_done"
+
     def run(self, step: Step, history: Optional[List] = None, goal: Optional[str] = None) -> StepResult:
         """执行单个 step，返回 StepResult。
 
@@ -102,11 +145,13 @@ class ReActEngine:
         循环：
         1. 以 system(步骤+工具目录+环境事实) + user(步骤目标) 调 LLM（带工具声明）
         2. 若 LLM 返回 tool_calls → 执行工具，把 Observation 作为 tool 消息回写，继续
-        3. 若 LLM 不再返回 tool_calls（直接给结论）→ 视为收敛，返回成功
+        3. 若 LLM 无 tool_calls → 基于 finish_reason 判定是否收敛
         4. 超过 max_iterations 未收敛 → 用 LLM 总结已有轨迹作为阶段性说明，
            但返回 success=False（未收敛 ≠ 完成），由上层标 FAILED 并触发 replan
         """
         self.last_trace = []
+        # 重置死循环检测器（每个 step 独立计数）
+        self._doom_detector.reset()
         # L5: 失败账本在 Agent 级别共享、run 开头 reset 一次（agent.py 调用）。
         # 跨 step 累计按设计：账本按 (工具, 错误类型) 分层——软错误（SANDBOX/TIMEOUT 等）
         # 只记数提示、不进总熔断，避免早前步骤的用法类失败连坐后续步骤的工具通道。
@@ -140,10 +185,34 @@ class ReActEngine:
                 self.last_trace.append({"thought": resp.content})
                 self._emit(EventType.THOUGHT, {"content": resp.content}, step_id=step.id)
 
-            # 无工具调用 → 模型给出最终结论，视为收敛
-            if not resp.tool_calls:
-                self.last_trace.append({"final": resp.content})
-                return StepResult(step_id=step.id, success=True, output=resp.content or "")
+            # 基于 finish_reason 判定是否收敛
+            should_term, reason = self._should_terminate_loop(resp)
+            if should_term:
+                if reason == "truncated":
+                    # token 截断：非正常完成，降级为失败
+                    self.last_trace.append({"final": resp.content, "finish_reason": "length"})
+                    self._emit(EventType.ERROR, {"reason": "truncated", "finish_reason": "length"}, step_id=step.id)
+                    fallback = self._summarize_unconverged(messages)
+                    return StepResult(
+                        step_id=step.id,
+                        success=False,
+                        output=fallback or resp.content or "",
+                        error="LLM 回复被截（token 用完），未完成本步骤",
+                    )
+                elif reason == "filtered":
+                    # 内容被过滤：非正常完成，降级为失败
+                    self.last_trace.append({"final": resp.content, "finish_reason": "content_filter"})
+                    self._emit(EventType.ERROR, {"reason": "filtered", "finish_reason": "content_filter"}, step_id=step.id)
+                    return StepResult(
+                        step_id=step.id,
+                        success=False,
+                        output=resp.content or "",
+                        error="LLM 回复被内容过滤拦截",
+                    )
+                else:
+                    # model_done 或 compat_done → 真正收敛
+                    self.last_trace.append({"final": resp.content, "finish_reason": resp.finish_reason})
+                    return StepResult(step_id=step.id, success=True, output=resp.content or "")
 
             # 把 assistant 的工具调用回写进上下文
             messages.append(
@@ -160,6 +229,22 @@ class ReActEngine:
                     args = json.loads(tc["function"]["arguments"] or "{}")
                 except json.JSONDecodeError:
                     args = {}
+
+                # Doom loop 检测：检查是否陷入重复调用模式
+                doom_warning = self._doom_detector.record(name, args)
+                if doom_warning:
+                    # 检测到死循环，注入告警但不阻断执行
+                    # 框架策略：告警注入 + 发事件，让 LLM 下一轮有机会自行调整
+                    self._emit(
+                        EventType.DOOM_LOOP_DETECTED,
+                        {"tool": name, "args": args, "warning": doom_warning},
+                        step_id=step.id,
+                    )
+                    # 将告警作为额外观察注入上下文（在工具执行结果之前）
+                    # 这样 LLM 能在下一轮看到告警并调整策略
+                    self.last_trace.append(
+                        {"doom_loop_warning": doom_warning, "tool": name, "args": args}
+                    )
 
                 # L5: 检查是否应该继续重试该工具
                 if self._failure_ledger and not self._failure_ledger.should_retry(name):

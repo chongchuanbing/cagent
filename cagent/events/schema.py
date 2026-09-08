@@ -27,6 +27,7 @@ class EventType(str, Enum):
     WORKSPACE_WRITE = "workspace_write"        # 会话向空间（workspace://）写入文件（审计）
     FINAL_ANSWER = "final_answer"        # 最终答案
     ERROR = "error"                      # 运行错误
+    DOOM_LOOP_DETECTED = "doom_loop_detected"  # 死循环检测触发
 
 
 class AgentEvent(BaseModel):

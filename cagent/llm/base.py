@@ -25,6 +25,10 @@ class LLMResponse:
     content: str
     # OpenAI 风格工具调用列表
     tool_calls: List[dict] = field(default_factory=list)
+    # API 返回的停止原因：stop/tool_calls(length)/content_filter 等
+    # 用于 ReAct 引擎判断收敛状态（对标 AgentScope 的 GenerateReason）
+    # 默认 None 兼容非 OpenAI 供应商
+    finish_reason: Optional[str] = None
     usage: Optional[dict] = None
     # 原始响应对象，便于调试
     raw: Optional[object] = None
