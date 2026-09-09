@@ -1,8 +1,13 @@
 """工具系统：Tool 基类与 @tool 装饰器。"""
 import inspect
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
+
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -62,6 +67,8 @@ class FunctionTool(Tool):
             out = self._func(**kwargs)
             return ToolResult(ok=True, content=str(out))
         except Exception as e:  # noqa: BLE001
+            logger.error(f"工具执行失败: {self.name}, 错误: {type(e).__name__}: {e}")
+            logger.debug(f"完整堆栈:\n{traceback.format_exc()}")
             return ToolResult(ok=False, content="", error=str(e))
 
     def schema(self) -> dict:

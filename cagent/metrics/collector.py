@@ -4,6 +4,9 @@ from typing import Dict, List, Optional
 
 from ..events.schema import AgentEvent, EventType
 from .schema import StepMetrics, ToolCallRecord, TurnMetrics
+from ..utils.logging import get_logger
+
+logger = get_logger("metrics.collector")
 
 
 class MetricsCollector:
@@ -16,7 +19,8 @@ class MetricsCollector:
     def __init__(self):
         self._current_turn: Optional[TurnMetrics] = None
         self._current_step: Optional[StepMetrics] = None
-        self._tool_call_timestamps: Dict[str, datetime] = {}  # key: "step_id:seq"
+        self._step_start_time: Optional[datetime] = None  # 当前 step 开始时间
+        self._pending_tool_calls: List[Dict] = []  # 存储未完成的工具调用 {step_id, seq, start_time}
     
     def handle_event(self, event: AgentEvent) -> None:
         """事件处理入口（注册为 EventHandler）。"""
@@ -72,6 +76,7 @@ class MetricsCollector:
             description=description,
             status="running",
         )
+        self._step_start_time = event.ts  # 记录 step 开始时间
     
     def _on_step_finished(self, event: AgentEvent) -> None:
         """Step 执行结束。"""
@@ -79,19 +84,14 @@ class MetricsCollector:
             return
         result = event.payload.get("result", {})
         self._current_step.status = "done" if result.get("success") else "failed"
-        # 计算 step 耗时（从第一个 tool_call 的时间戳推算）
-        if self._current_step.tool_calls:
-            # 找到第一个 tool_call 的时间戳
-            first_seq = self._current_step.tool_calls[0].seq
-            if first_seq > 0:
-                key = f"{self._current_step.step_id}:{first_seq}"
-                first_tc_time = self._tool_call_timestamps.get(key)
-                if first_tc_time:
-                    self._current_step.duration_ms = int(
-                        (event.ts - first_tc_time).total_seconds() * 1000
-                    )
+        # 计算 step 耗时
+        if self._step_start_time:
+            self._current_step.duration_ms = int(
+                (event.ts - self._step_start_time).total_seconds() * 1000
+            )
         self._current_turn.steps.append(self._current_step)
         self._current_step = None
+        self._step_start_time = None  # 清空 step 开始时间
     
     def _on_thought(self, event: AgentEvent) -> None:
         """LLM 推理过程。"""
@@ -105,10 +105,7 @@ class MetricsCollector:
             return
         name = event.payload.get("name", "")
         args = event.payload.get("args", {})
-        # 记录时间戳（用于计算耗时）
-        key = f"{self._current_step.step_id}:{event.seq}"
-        self._tool_call_timestamps[key] = event.ts
-        # 创建 ToolCallRecord（等 TOOL_RESULT 回填结果）
+        # 创建 ToolCallRecord
         record = ToolCallRecord(
             tool_name=name,
             args=args,
@@ -119,27 +116,53 @@ class MetricsCollector:
             seq=event.seq,
         )
         self._current_step.tool_calls.append(record)
+        # 记录到待匹配列表（用于 TOOL_RESULT 匹配）
+        self._pending_tool_calls.append({
+            "tool_name": name,
+            "step_id": self._current_step.step_id,
+            "seq": event.seq,
+            "start_time": event.ts,
+        })
     
     def _on_tool_result(self, event: AgentEvent) -> None:
         """工具调用结束（代理层）。"""
-        if not self._current_step:
-            return
         name = event.payload.get("name", "")
         content = event.payload.get("content", "")
         ok = event.payload.get("ok", True)
-        # 找到对应的 TOOL_CALL 记录（按 step_id + seq）
-        key = f"{self._current_step.step_id}:{event.seq}"
-        start_time = self._tool_call_timestamps.pop(key, None)
-        duration_ms = 0
-        if start_time:
-            duration_ms = int((event.ts - start_time).total_seconds() * 1000)
-        # 回填到 ToolCallRecord
-        for tc in reversed(self._current_step.tool_calls):
-            if tc.seq == event.seq:
-                tc.ok = ok
-                tc.duration_ms = duration_ms
-                tc.observation_length = len(content)
+        
+        # 从待匹配列表中查找（按工具名）
+        matched_idx = None
+        for i, pending in enumerate(self._pending_tool_calls):
+            if pending["tool_name"] == name:
+                matched_idx = i
                 break
+        
+        if matched_idx is None:
+            logger.warning(f"[MetricsCollector] TOOL_RESULT {name}: 未找到匹配的 TOOL_CALL")
+            return
+        
+        # 计算耗时并更新记录
+        pending = self._pending_tool_calls.pop(matched_idx)
+        duration_ms = int((event.ts - pending["start_time"]).total_seconds() * 1000)
+        seq = pending["seq"]
+        
+        # 在当前 step 中查找对应的 ToolCallRecord
+        if self._current_step:
+            for tc in self._current_step.tool_calls:
+                if tc.seq == seq:
+                    tc.duration_ms = duration_ms
+                    tc.observation_length = len(content)
+                    tc.ok = ok
+                    break
+        # 在已完成的 steps 中查找（不应该发生，但作为兜底）
+        elif self._current_turn:
+            for step in self._current_turn.steps:
+                for tc in step.tool_calls:
+                    if tc.seq == seq:
+                        tc.duration_ms = duration_ms
+                        tc.observation_length = len(content)
+                        tc.ok = ok
+                        break
     
     def _on_real_tool_exec(self, event: AgentEvent) -> None:
         """真实工具执行（run_tool 代理内部）。

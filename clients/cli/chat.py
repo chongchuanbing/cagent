@@ -7,8 +7,13 @@
   python -m clients.cli chat              # 启动新会话
   python -m clients.cli chat --session-id abc123  # 续接指定会话
 """
+import traceback
 import uuid
 from typing import Optional
+
+from cagent.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def cmd_chat(args) -> int:
@@ -38,12 +43,19 @@ def cmd_chat(args) -> int:
     if resume:
         from cagent.storage import SessionRecorder
 
-        prior = SessionRecorder(agent.storage, sid).load_history()
-        if prior:
-            last = prior[-1]
-            print(f"已加载该会话历史：目标「{last['description'][:50]}」→ {last['output'][:50]}")
+        prior_recorder = SessionRecorder(agent.storage, sid)
+        if prior_recorder.is_interrupted():
+            # 中断恢复：显示中断状态，用户输入"继续"即可恢复
+            meta = prior_recorder.load_meta()
+            print(f"检测到上次会话中断，状态：interrupted")
+            print(f"输入「继续」恢复执行，输入其他内容将作为新任务开始")
         else:
-            print(f"（会话 {sid} 无历史记录，将作为新会话开始）")
+            prior = prior_recorder.load_history()
+            if prior:
+                last = prior[-1]
+                print(f"已加载该会话历史：目标「{last['description'][:50]}」→ {last['output'][:50]}")
+            else:
+                print(f"（会话 {sid} 无历史记录，将作为新会话开始）")
     print(f"输入 /exit 退出，/history 查看历史上下文，/sessions 列出所有会话")
     print()
 
@@ -77,11 +89,30 @@ def cmd_chat(args) -> int:
             _list_sessions(agent)
             continue
 
+        # 检查是否触发中断恢复
+        if resume and goal.lower() in ["继续", "continue", "恢复", "resume"]:
+            from cagent.storage import SessionRecorder
+            recorder = SessionRecorder(agent.storage, sid)
+            if recorder.is_interrupted():
+                print("检测到中断会话，开始恢复执行...")
+                try:
+                    # 使用原目标继续执行
+                    meta = recorder.load_meta()
+                    original_goal = meta.get("goal", "")
+                    agent.run_interrupted(session_id=sid, space_dir=space_dir)
+                except Exception as e:
+                    logger.exception(f"恢复执行失败: {type(e).__name__}: {e}")
+                    print(f"恢复执行失败: {type(e).__name__}: {e}")
+                continue
+
         # 执行 agent
         try:
             agent.run(goal, session_id=sid, resume=resume, space_dir=space_dir)
         except Exception as e:
-            print(f"执行错误: {e}")
+            logger.exception(f"执行错误: {type(e).__name__}: {e}")
+            print(f"执行错误: {type(e).__name__}: {e}")
+            if logger.level == 10:  # DEBUG
+                traceback.print_exc()
 
         # 首轮执行后，后续轮自动 resume 带历史上下文
         resume = True

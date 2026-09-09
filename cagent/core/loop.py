@@ -1,4 +1,5 @@
 """AgentLoop：外层编排控制，串联 Plan-Executor 与 ReAct。"""
+import traceback
 from typing import List, Optional
 
 from ..schema.plan import Plan, Step, StepResult, StepStatus
@@ -13,6 +14,9 @@ from ..prompts.summarize_prompt import (
 from ..events import EventEmitter, EventType
 from .planner import Planner
 from .executor import Executor
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class AgentLoop:
@@ -34,21 +38,51 @@ class AgentLoop:
         self.config = config
         self.emitter = emitter
 
-    def run(self, goal: str, recorder=None, session_id: Optional[str] = None, memory=None, prior_history: List[dict] = None) -> str:
+    def run(
+        self,
+        goal: str,
+        recorder=None,
+        session_id: Optional[str] = None,
+        memory=None,
+        prior_history: List[dict] = None,
+        resume_plan: Optional[Plan] = None,
+        resume_history: Optional[List[dict]] = None,
+    ) -> str:
         """运行至计划完成或终止条件触发，返回最终答案。
 
         recorder 为 SessionRecorder 时，会把 meta / plan / 每步 trace 落盘；
         session_id 会附加到发出的事件上；
         memory 为 MemoryService 时，开始召回长期记忆注入上下文、结束提取沉淀；
-        prior_history 为会话恢复时的历史上下文，注入到 planner 的 context 和首轮 history。
+        prior_history 为会话恢复时的历史上下文，注入到 planner 的 context 和首轮 history；
+        resume_plan 为中断恢复时的计划对象；
+        resume_history 为中断恢复时的历史上下文。
         """
         try:
-            return self._run(goal, recorder=recorder, session_id=session_id, memory=memory, prior_history=prior_history)
+            return self._run(
+                goal,
+                recorder=recorder,
+                session_id=session_id,
+                memory=memory,
+                prior_history=prior_history,
+                resume_plan=resume_plan,
+                resume_history=resume_history,
+            )
         except Exception as e:  # noqa: BLE001 —— 运行异常以事件暴露
+            logger.exception(f"AgentLoop.run 执行失败: {type(e).__name__}: {e}")
             self._emit(EventType.ERROR, {"message": str(e)}, session_id=session_id)
             raise
 
-    def _run(self, goal: str, recorder=None, session_id: Optional[str] = None, memory=None, prior_history: List[dict] = None) -> str:
+    def _run(
+        self,
+        goal: str,
+        recorder=None,
+        session_id: Optional[str] = None,
+        memory=None,
+        prior_history: Optional[List[dict]] = None,
+        resume_plan: Optional[Plan] = None,
+        resume_history: Optional[List[dict]] = None,
+    ) -> str:
+        logger.info(f"_run: 开始执行目标 - {goal[:100]}")
         if recorder:
             recorder.record_meta(goal)
         # 度量采集：标记 turn 开始
@@ -56,83 +90,131 @@ class AgentLoop:
         # 长期记忆召回：作为上下文前缀注入每个 step（不受 history 窗口淘汰影响）
         memory_prefix: List[dict] = []
         if memory is not None:
+            logger.debug("_run: 开始召回长期记忆")
             recalled = memory.recall(goal, session_id=session_id)
             if recalled:
+                logger.info(f"_run: 召回 {len(recalled)} 条长期记忆")
                 memory_prefix = [{"memory": [r.content for r in recalled]}]
-        # 会话恢复：注入上轮历史作为 planner 上下文和初始 history
-        prior_history = prior_history or []
-        plan: Plan = self.planner.plan(goal, context=prior_history)
-        self._emit(EventType.PLAN_CREATED, {"plan": plan.model_dump()}, session_id=session_id)
-        if recorder:
-            recorder.record_plan(plan)
-        executed = 0
-        # 跨 step 共享上下文：每步完成后追加本步结论与工具观察（含 ask_user 的用户反馈）
-        history: List[dict] = list(prior_history)
 
-        while not self._should_terminate(plan):
-            step = self.executor.next_step(plan)
-            if step is None:
-                break
-
-            self._emit(
-                EventType.STEP_STARTED,
-                {"step": {"id": step.id, "description": step.description}},
-                session_id=session_id, step_id=step.id,
+        # 中断恢复 vs 正常多轮：两条路径
+        if resume_plan is not None:
+            # 中断恢复路径：使用传入的旧 plan 和 history
+            plan = resume_plan
+            history = resume_history or []
+            done_count = sum(1 for s in plan.steps if s.status == StepStatus.DONE)
+            logger.info(
+                f"_run: 中断恢复模式，加载旧 plan（{len(plan.steps)} steps，"
+                f"{done_count} done，{sum(1 for s in plan.steps if s.status == StepStatus.PENDING)} pending）"
             )
-            result: StepResult = self.executor.execute_step(
-                step, history=memory_prefix + history, goal=goal
-            )
-            trace = self.executor.react_engine.last_trace
+            logger.info(f"_run: 中断恢复模式，加载旧 history（{len(history)} 条）")
+        else:
+            # 正常多轮路径：生成新 plan
+            prior_history = prior_history or []
+            logger.info(f"_run: 开始生成计划，历史上下文 {len(prior_history)} 条")
+            plan: Plan = self.planner.plan(goal, context=prior_history)
+            logger.info(f"_run: 计划生成完成，共 {len(plan.steps)} 个步骤")
+            self._emit(EventType.PLAN_CREATED, {"plan": plan.model_dump()}, session_id=session_id)
             if recorder:
-                for entry in trace:
-                    recorder.record_trace(entry)
-            self.executor.update(plan, result)
-            self._emit(
-                EventType.STEP_FINISHED,
-                {
-                    "step": {"id": step.id, "description": step.description},
-                    "result": result.model_dump(),
-                },
-                session_id=session_id, step_id=step.id,
-            )
-            history.append(self._history_entry(step, result, trace))
-            history = self._apply_window(history)
-            executed += 1
+                recorder.record_plan(plan)
+            history: List[dict] = list(prior_history)
 
-            if executed >= self.max_steps:
-                break
+        executed = 0
+        logger.info(f"_run: 开始执行主循环，共 {len(plan.steps)} 个步骤")
+        try:
+            while not self._should_terminate(plan):
+                step = self.executor.next_step(plan)
+                if step is None:
+                    logger.info("_run: 无可执行步骤，退出循环")
+                    break
 
-            # 成功后自动增量调整未执行的 steps
-            if result.success and plan.pending_steps():
-                adjusted = None
-                try:
-                    adjusted = self.planner.adjust(plan, step, history)
-                except Exception:
-                    pass  # adjust 失败不影响主流程
-                if adjusted is not None:
-                    plan = adjusted
+                logger.info(f"_run: 开始执行步骤 {step.id} - {step.description[:50]}")
+                self._emit(
+                    EventType.STEP_STARTED,
+                    {"step": {"id": step.id, "description": step.description}},
+                    session_id=session_id, step_id=step.id,
+                )
+                result: StepResult = self.executor.execute_step(
+                    step, history=memory_prefix + history, goal=goal
+                )
+                logger.info(f"_run: 步骤 {step.id} 执行完成，状态: {'成功' if result.success else '失败'}")
+                trace = self.executor.react_engine.last_trace
+                if recorder:
+                    for entry in trace:
+                        recorder.record_trace(entry)
+                self.executor.update(plan, result)
+                self._emit(
+                    EventType.STEP_FINISHED,
+                    {
+                        "step": {"id": step.id, "description": step.description},
+                        "result": result.model_dump(),
+                    },
+                    session_id=session_id, step_id=step.id,
+                )
+                history_entry = self._history_entry(step, result, trace)
+                history.append(history_entry)
+                history = self._apply_window(history)
+
+                # 实时持久化：每步完成后立即保存 plan 状态和 history 条目
+                # 这样中断后可以从断点恢复，而不是从头开始
+                if recorder:
+                    recorder.record_plan(plan)  # 保存最新的 step 状态
+                    recorder.record_history_entry(history_entry)  # 追加本步 history
+
+                executed += 1
+
+                if executed >= self.max_steps:
+                    logger.warning(f"_run: 达到最大步骤数限制 {self.max_steps}，强制退出")
+                    break
+
+                # 成功后自动增量调整未执行的 steps
+                if result.success and plan.pending_steps():
+                    adjusted = None
+                    try:
+                        logger.debug(f"_run: 步骤 {step.id} 成功，尝试调整计划")
+                        adjusted = self.planner.adjust(plan, step, history)
+                    except Exception as e:
+                        logger.exception(f"Planner.adjust 失败: {type(e).__name__}: {e}")
+                        pass  # adjust 失败不影响主流程
+                    if adjusted is not None:
+                        plan = adjusted
+                        logger.info(f"_run: 计划调整完成，新版本 {plan.version}")
+                        self._emit(
+                            EventType.PLAN_ADJUSTED,
+                            {"plan": plan.model_dump()},
+                            session_id=session_id,
+                        )
+                        if recorder:
+                            recorder.record_plan(plan)
+
+                if self.planner.should_replan(plan, result):
+                    logger.warning(f"_run: 步骤 {step.id} 失败，需要重新规划")
+                    failed = next(s for s in plan.steps if s.id == result.step_id)
+                    obs = Observation(content=result.error or result.output)
+                    plan = self.planner.replan(plan, failed, obs)
                     self._emit(
-                        EventType.PLAN_ADJUSTED,
-                        {"plan": plan.model_dump()},
+                        EventType.REPLANNED, {"plan": plan.model_dump()},
                         session_id=session_id,
                     )
                     if recorder:
                         recorder.record_plan(plan)
 
-            if self.planner.should_replan(plan, result):
-                failed = next(s for s in plan.steps if s.id == result.step_id)
-                obs = Observation(content=result.error or result.output)
-                plan = self.planner.replan(plan, failed, obs)
-                self._emit(
-                    EventType.REPLANNED, {"plan": plan.model_dump()},
-                    session_id=session_id,
-                )
-                if recorder:
-                    recorder.record_plan(plan)
+            logger.info(f"_run: 主循环结束，共执行 {executed} 个步骤")
+            if recorder:
+                recorder.finish()
+        except Exception:
+            # 异常中断：标记 meta.status = "interrupted"，保留已执行步骤的状态，
+            # 下次 resume 时 Agent.run() 可检测到并走中断恢复路径
+            logger.exception("_run: 执行异常，标记会话为中断状态")
+            if recorder:
+                try:
+                    recorder.finish(status="interrupted")
+                except Exception:
+                    logger.exception("_run: finish(interrupted) 失败")
+            raise
 
-        if recorder:
-            recorder.finish()
+        logger.debug("_run: 开始生成最终总结")
         answer = self._summarize(plan)
+        logger.info(f"_run: 最终总结生成完成，长度 {len(answer)} 字符")
         self._emit(
             EventType.FINAL_ANSWER, {"answer": answer},
             session_id=session_id,
@@ -141,8 +223,8 @@ class AgentLoop:
         if memory is not None:
             try:
                 memory.absorb(goal, history, answer, session_id=session_id)
-            except Exception:  # noqa: BLE001 —— 记忆沉淀失败不影响主流程
-                pass
+            except Exception as e:  # noqa: BLE001 —— 记忆沉淀失败不影响主流程
+                logger.exception(f"Memory.absorb 失败: {type(e).__name__}: {e}")
 
             # L6: 将失败账本中的环境事实沉淀到长期记忆
             if self.executor.react_engine._failure_ledger is not None:
@@ -152,8 +234,8 @@ class AgentLoop:
                         None,
                         session_id=session_id,
                     )
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    logger.exception(f"Memory.absorb_env_facts 失败: {type(e).__name__}: {e}")
 
         # 度量采集：标记 turn 结束
         self._emit(EventType.TURN_FINISHED, {"status": "done"}, session_id=session_id)
@@ -324,7 +406,8 @@ class AgentLoop:
                 Message(role=MessageRole.USER, content=f"待压缩的历史记录：\n{digest}"),
             ])
             return resp.content or digest
-        except Exception:  # noqa: BLE001 —— 摘要失败不影响主流程
+        except Exception as e:  # noqa: BLE001 —— 摘要失败不影响主流程
+            logger.exception(f"LLM 摘要失败: {type(e).__name__}: {e}")
             return digest
 
     def _summarize(self, plan: Plan) -> str:

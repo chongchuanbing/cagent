@@ -4,6 +4,7 @@
   1. tool_guide — 查询操作树任意节点的说明（中间节点列子节点，叶子节点返回格式）
   2. run_tool — 执行叶子操作（支持 executor / shell / mcp 三种执行模式）
 """
+import json
 from typing import Dict, Optional
 
 from ..tools.base import Tool, ToolResult
@@ -194,8 +195,24 @@ class RunToolTool(Tool):
                 error=f"'{path}' 不是可执行操作（是子组），请调 tool_guide 查看其子操作",
             )
 
+        # 防御：LLM 有时把 params 以 JSON 字符串形式传入
+        params = params or {}
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except (json.JSONDecodeError, TypeError):
+                return ToolResult(
+                    ok=False, content="",
+                    error="参数 'params' 必须是 JSON 对象，传入的字符串无法解析",
+                )
+        if not isinstance(params, dict):
+            return ToolResult(
+                ok=False, content="",
+                error=f"参数 'params' 类型错误：期望 dict，实际 {type(params).__name__}",
+            )
+
         # 参数校验
-        params = self._validate_params(node, params or {})
+        params = self._validate_params(node, params)
         if params is None:
             return ToolResult(ok=False, content="", error="参数校验失败")
 

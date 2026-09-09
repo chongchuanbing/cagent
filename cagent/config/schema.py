@@ -157,6 +157,19 @@ class SandboxConfig(BaseModel):
     user: Optional[str] = None
 
 
+class MetricsConfig(BaseModel):
+    """执行度量采集配置。
+
+    - enabled：是否开启度量采集（默认 true）；
+    - backend：存储后端类型，目前支持 jsonl，后续可扩展 sqlite；
+    - retention_days：度量数据保留天数，0 表示永久保留。
+    """
+
+    enabled: bool = True
+    backend: Literal["jsonl", "sqlite"] = "jsonl"
+    retention_days: int = 0
+
+
 class AgentConfig(BaseModel):
     """端上配置文件（agent.yaml）对应的顶层结构。"""
 

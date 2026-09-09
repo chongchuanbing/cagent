@@ -16,6 +16,9 @@ from ..prompts.planner_prompt import (
     ADJUST_SYSTEM_PROMPT,
 )
 from ..config.provider import ConfigProvider
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def _extract_json_block(text: str) -> dict:
@@ -27,16 +30,17 @@ def _extract_json_block(text: str) -> dict:
         text = match.group(1).strip()
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         # 回退：用 raw_decode 精确提取第一个 JSON 对象
+        logger.debug(f"JSON 解析失败，尝试 raw_decode: {e}")
         decoder = json.JSONDecoder()
         start = text.find("{")
         if start != -1:
             try:
                 obj, _ = decoder.raw_decode(text[start:])
                 return obj
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e2:
+                logger.debug(f"raw_decode 也失败: {e2}")
         raise
 
 
@@ -101,6 +105,7 @@ class Planner:
 
     def plan(self, goal: str, context: Optional[List] = None) -> Plan:
         """生成初始 Plan（LLM → JSON → Plan）。"""
+        logger.info(f"开始生成初始计划 goal={goal[:50]}... context_count={len(context or [])}")
         system = (
             self.config.get_prompt("planner_system", default=PLANNER_SYSTEM_PROMPT)
             if self.config
@@ -112,10 +117,13 @@ class Planner:
                 Message(role=MessageRole.USER, content=build_planner_prompt(goal, context or [])),
             ]
         )
-        return self._build_plan(resp.content, goal)
+        plan = self._build_plan(resp.content, goal)
+        logger.info(f"初始计划生成完成 steps={len(plan.steps)}")
+        return plan
 
     def replan(self, plan: Plan, failed_step: Step, obs: Observation) -> Plan:
         """结合失败观察让 LLM 重新规划。"""
+        logger.info(f"开始重规划 failed_step={failed_step.id} error={obs.content[:100]}")
         system = (
             self.config.get_prompt("replan_system", default=REPLAN_SYSTEM_PROMPT)
             if self.config
@@ -128,9 +136,12 @@ class Planner:
             ]
         )
         try:
-            return self._build_plan(resp.content, plan.goal)
+            new_plan = self._build_plan(resp.content, plan.goal)
+            logger.info(f"重规划完成 new_steps={len(new_plan.steps)}")
+            return new_plan
         except (json.JSONDecodeError, ValueError):
             # 解析失败则保留原计划但标记失败步骤，避免循环崩溃
+            logger.warning("重规划 JSON 解析失败，保留原计划")
             return plan
 
     def should_replan(self, plan: Plan, step_result: StepResult) -> bool:
@@ -150,8 +161,10 @@ class Planner:
         """
         # 无 PENDING steps 时不需要调整
         if not plan.pending_steps():
+            logger.debug("adjust: 无 pending steps，跳过调整")
             return None
 
+        logger.info(f"adjust: 开始评估 step {completed_step.id} 完成后的计划调整")
         system = (
             self.config.get_prompt("adjust_system", default=ADJUST_SYSTEM_PROMPT)
             if self.config
@@ -165,11 +178,14 @@ class Planner:
             data = _extract_json_block(resp.content)
         except (json.JSONDecodeError, ValueError):
             # LLM 输出解析失败，跳过调整
+            logger.warning("adjust: LLM 输出解析失败，跳过调整")
             return None
 
         if not isinstance(data, dict):
+            logger.warning("adjust: LLM 返回非 dict 类型")
             return None
         if data.get("action") == "no_change":
+            logger.debug("adjust: 无需调整")
             return None
 
         add = data.get("add", [])
@@ -183,10 +199,13 @@ class Planner:
         if not isinstance(modify, list):
             modify = []
         if not add and not remove and not modify:
+            logger.debug("adjust: 无实际调整操作")
             return None
 
         old_version = plan.version
         changed = plan.apply_adjust(add=add, remove=remove, modify=modify)
         if changed:
+            logger.info(f"adjust: 计划已调整，version {old_version} → {plan.version}")
             return plan
+        logger.debug("adjust: 应用调整后无实际变更")
         return None

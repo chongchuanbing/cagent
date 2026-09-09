@@ -12,6 +12,10 @@
 import json
 from typing import Dict, Optional, Tuple
 
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 # ===== 错误类型分层 =====
 # 硬错误：契约/环境级（工具不存在、参数缺失）——重复失败说明该路径不可行，允许计入熔断。
 HARD_ERROR_KINDS = {"TOOL_UNAVAILABLE", "PARAM_MISSING"}
@@ -105,6 +109,9 @@ class FailureLedger:
         # 只有硬错误才累计总熔断
         if error_kind in HARD_ERROR_KINDS:
             self._total_failures += 1
+            logger.info(f"硬错误累计: {tool_name} ({error_kind}), 总计 {self._total_failures}/{self.max_total_failures}")
+
+        logger.debug(f"记录失败: {tool_name}, 类型={error_kind}, 细粒度计数={self._fine_failures.get(fine_key, 0)}")
 
     def get_failure_count(self, tool_name: str, args: Optional[dict] = None) -> int:
         """获取指定工具的失败次数。

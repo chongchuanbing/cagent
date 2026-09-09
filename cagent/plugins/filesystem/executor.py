@@ -109,6 +109,24 @@ def _collect_added_lines(lines: List[str], i: int, action: _PatchAction) -> int:
     return i
 
 
+def _is_unified_diff_metadata(line: str) -> bool:
+    """检测 unified diff 格式的元数据行（---、+++、@@ ... @@）。
+
+    LLM 生成的补丁有时会混入 unified diff 头，这些行不是实际内容，
+    应该被跳过，避免被误当作上下文行。
+    """
+    # @@ ... @@ 是 hunk 范围头
+    stripped = line.strip()
+    if stripped.startswith("@@") and stripped.endswith("@@"):
+        return True
+    # --- / +++ 是文件路径头（--- 原文件、+++ 新文件）
+    # 前缀直接检查前 3 字符，第 4 字符是空格或行尾
+    if len(line) >= 3:
+        if line[:3] in ("---", "+++"):
+            return True
+    return False
+
+
 def _collect_hunks(lines: List[str], i: int, action: _PatchAction) -> int:
     n = len(lines)
     hunk = _Hunk()
@@ -123,6 +141,10 @@ def _collect_hunks(lines: List[str], i: int, action: _PatchAction) -> int:
             if has_content:
                 action.hunks.append(hunk)
             return i
+        # 跳过 unified diff 元数据行（---、+++、@@ ... @@）
+        if _is_unified_diff_metadata(line):
+            i += 1
+            continue
         if line.startswith("+"):
             hunk.added.append(line[1:])
             has_content = True

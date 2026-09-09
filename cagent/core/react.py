@@ -16,8 +16,11 @@ from ..prompts.react_prompt import (
 from ..config.provider import ConfigProvider
 from ..events import EventEmitter, EventType
 from ..plugins.capability import CapabilityProbe
+from ..utils.logging import get_logger
 from .failure_ledger import FailureLedger
 from .doom_loop import DoomLoopDetector
+
+logger = get_logger(__name__)
 
 
 class ReActEngine:
@@ -149,6 +152,7 @@ class ReActEngine:
         4. 超过 max_iterations 未收敛 → 用 LLM 总结已有轨迹作为阶段性说明，
            但返回 success=False（未收敛 ≠ 完成），由上层标 FAILED 并触发 replan
         """
+        logger.info(f"ReAct 开始执行 step {step.id}")
         self.last_trace = []
         # 重置死循环检测器（每个 step 独立计数）
         self._doom_detector.reset()
@@ -157,6 +161,7 @@ class ReActEngine:
         # 只记数提示、不进总熔断，避免早前步骤的用法类失败连坐后续步骤的工具通道。
         history = history or []
         tools = self._select_tools(step, goal)
+        logger.debug(f"step {step.id} 选中工具数: {len(tools)}")
         # 执行只认本 step 选中的工具集：被分组裁剪 / 未被选中的工具
         # 即使被模型幻觉调用，也按不可用处理
         available = {t.name: t for t in tools}
@@ -190,6 +195,7 @@ class ReActEngine:
             if should_term:
                 if reason == "truncated":
                     # token 截断：非正常完成，降级为失败
+                    logger.warning(f"step {step.id} 因 token 截断而终止")
                     self.last_trace.append({"final": resp.content, "finish_reason": "length"})
                     self._emit(EventType.ERROR, {"reason": "truncated", "finish_reason": "length"}, step_id=step.id)
                     fallback = self._summarize_unconverged(messages)
@@ -201,6 +207,7 @@ class ReActEngine:
                     )
                 elif reason == "filtered":
                     # 内容被过滤：非正常完成，降级为失败
+                    logger.warning(f"step {step.id} 因内容过滤而终止")
                     self.last_trace.append({"final": resp.content, "finish_reason": "content_filter"})
                     self._emit(EventType.ERROR, {"reason": "filtered", "finish_reason": "content_filter"}, step_id=step.id)
                     return StepResult(
@@ -211,6 +218,7 @@ class ReActEngine:
                     )
                 else:
                     # model_done 或 compat_done → 真正收敛
+                    logger.info(f"step {step.id} 收敛成功 (reason={reason})")
                     self.last_trace.append({"final": resp.content, "finish_reason": resp.finish_reason})
                     return StepResult(step_id=step.id, success=True, output=resp.content or "")
 
@@ -376,7 +384,8 @@ class ReActEngine:
                 messages + [Message(role=MessageRole.USER, content=prompt)]
             )
             return (resp.content or "").strip() or None
-        except Exception:  # noqa: BLE001 —— 兜底失败不影响主流程
+        except Exception as e:  # noqa: BLE001 —— 兜底失败不影响主流程
+            logger.exception(f"未收敛兜底失败: {type(e).__name__}: {e}")
             return None
 
     def _emit(self, type: EventType, payload: dict, step_id: Optional[str] = None) -> None:

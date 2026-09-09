@@ -154,7 +154,8 @@ class Agent:
         if raw_space is None and self.config is not None:
             try:
                 raw_space = self.config.get_config().paths.space_dir
-            except Exception:  # noqa: BLE001 —— 配置异常时退回无空间模式
+            except Exception as e:  # noqa: BLE001 —— 配置异常时退回无空间模式
+                logger.warning(f"读取配置异常，使用默认值: {type(e).__name__}: {e}")
                 raw_space = None
         space_root = None
         if raw_space:
@@ -213,7 +214,8 @@ class Agent:
         try:
             if not self.config.get_config().memory.enabled:
                 return None
-        except Exception:  # noqa: BLE001 —— 配置异常时不阻塞 Agent 构造
+        except Exception as e:  # noqa: BLE001 —— 配置异常时不阻塞 Agent 构造
+            logger.warning(f"读取 memory 配置异常: {type(e).__name__}: {e}")
             return None
         return MemoryService(
             self.storage, config=self.config, emitter=self.emitter,
@@ -254,28 +256,71 @@ class Agent:
                 rt.set_memory(self.memory)
         recorder = SessionRecorder(self.storage, sid)
 
-        # 恢复历史上下文
+        # 检测中断恢复：检查上次会话是否中断
+        is_interrupted = recorder.is_interrupted()
+        resume_plan = None
+        resume_history = None
+
+        if is_interrupted:
+            # 中断恢复：加载上次的 plan 和 history
+            try:
+                plan_dict = recorder.load_interrupted_plan()
+                if plan_dict:
+                    from ..schema.plan import Plan
+                    resume_plan = Plan.model_validate(plan_dict)
+                    resume_history = recorder.load_history_from_file()
+                    logger.info(
+                        f"检测到中断会话，恢复执行：{len(resume_plan.steps)} steps，"
+                        f"{sum(1 for s in resume_plan.steps if s.status.value == 'done')} done，"
+                        f"{sum(1 for s in resume_plan.steps if s.status.value == 'pending')} pending"
+                    )
+                    # 重置中断状态，防止下次 run 继续尝试恢复
+                    recorder.finish(status="resuming")
+            except Exception as e:
+                logger.warning(f"中断恢复失败，将作为新会话执行: {e}")
+                resume_plan = None
+                resume_history = None
+
+        # 恢复历史上下文（正常多轮对话）
         prior_history = None
-        if resume:
+        if resume and not resume_plan:
             prior_history = recorder.load_history()
 
-        # 执行任务
-        if scope is not None:
-            from contextlib import ExitStack
+        # 启动会话级日志（写入 sessions/<sid>/agent.log）
+        # recorder._prefix 是 "sessions/<sid>"，需要拼接 storage root 得到完整路径
+        storage_root = getattr(self.storage, "root", None)
+        if storage_root:
+            log_dir = os.path.join(storage_root, recorder._prefix)
+            log_path = setup_session_logger(sid, log_dir)
+            logger.info(f"会话启动 session_id={sid} goal={goal[:50]} log_path={log_path}")
 
-            from ..runtime.session_scope import enter_scope
+        try:
+            # 执行任务
+            if scope is not None:
+                from contextlib import ExitStack
 
-            with ExitStack() as stack:
-                stack.enter_context(enter_scope(scope))
+                from ..runtime.session_scope import enter_scope
+
+                with ExitStack() as stack:
+                    stack.enter_context(enter_scope(scope))
+                    result = loop.run(
+                        goal, recorder=recorder, session_id=sid,
+                        memory=self.memory, prior_history=prior_history,
+                        resume_plan=resume_plan, resume_history=resume_history,
+                    )
+            else:
                 result = loop.run(
                     goal, recorder=recorder, session_id=sid,
                     memory=self.memory, prior_history=prior_history,
+                    resume_plan=resume_plan, resume_history=resume_history,
                 )
-        else:
-            result = loop.run(
-                goal, recorder=recorder, session_id=sid,
-                memory=self.memory, prior_history=prior_history,
-            )
+        except Exception as e:
+            # 记录完整堆栈到文件日志
+            logger.exception(f"会话执行异常 session_id={sid}: {e}")
+            raise
+        finally:
+            logger.info(f"会话结束 session_id={sid}")
+            teardown_session_logger()
         
         # 保存度量数据
         turn_metrics = self.metrics_collector.get_current_turn()
@@ -283,3 +328,36 @@ class Agent:
             recorder.record_metrics(turn_metrics)
         
         return result
+
+    def run_interrupted(
+        self,
+        session_id: Optional[str] = None,
+        space_dir: Optional[str] = None,
+    ) -> str:
+        """从上次中断的会话恢复执行。
+
+        与 run() 的区别：
+        - run(): 总是使用新的 goal，可以传入 resume=True 加载历史上下文
+        - run_interrupted(): 专门用于中断恢复，自动加载上次的 plan 和 history，
+          跳过已完成的 steps，继续执行剩余的 PENDING steps
+
+        实现：构造一个特殊的 goal 调用 run()，让 Agent 继续执行上次的任务。
+        """
+        if session_id is None:
+            raise ValueError("run_interrupted 必须指定 session_id")
+
+        recorder = SessionRecorder(self.storage, session_id)
+        if not recorder.is_interrupted():
+            raise ValueError(f"会话 {session_id} 不是中断状态，无法恢复")
+
+        # 加载上次的 goal
+        meta = recorder.load_meta()
+        original_goal = meta.get("goal", "继续执行上次的任务")
+
+        # 调用 run()，传入 resume=True 让它走中断恢复路径
+        return self.run(
+            goal=f"继续：{original_goal}",
+            session_id=session_id,
+            resume=True,
+            space_dir=space_dir,
+        )

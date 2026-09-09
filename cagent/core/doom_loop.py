@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import json
 
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class DoomLoopDetector:
@@ -55,6 +59,7 @@ class DoomLoopDetector:
             if all(k == recent[0] for k in recent):
                 if not self._alerted:
                     self._alerted = True
+                    logger.warning(f"死循环检测触发: {tool_name} 连续 {self.threshold} 次相同调用")
                     return (
                         f"⚠️ 死循环检测：工具 {tool_name} 已连续调用 {self.threshold} 次且参数完全相同。"
                         "请换一种方法或调整参数，不要重复相同的操作。"

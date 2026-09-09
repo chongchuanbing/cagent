@@ -17,7 +17,10 @@ from ..prompts.memory_prompt import (
 )
 from ..schema.message import Message, MessageRole
 from ..utils import sanitize_text
+from ..utils.logging import get_logger
 from .schema import MemoryRecord
+
+logger = get_logger(__name__)
 
 
 def _parse_json_array(text: str) -> list:
@@ -61,7 +64,8 @@ class MemoryExtractor:
             return None
         try:
             return self._llm_factory()
-        except Exception:  # noqa: BLE001 —— 无可用 LLM 时跳过提取
+        except Exception as e:  # noqa: BLE001 —— 无可用 LLM 时跳过提取
+            logger.warning(f"LLM factory failed: {type(e).__name__}: {e}")
             return None
 
     def _cfg(self):

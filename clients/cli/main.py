@@ -131,7 +131,8 @@ def _build_agent(config_path: Optional[str] = None, emitter=None):
 
     # 环境探测（用于工具可用性检查和回退提示）
     from cagent.plugins.capability import CapabilityProbe
-    capability = CapabilityProbe(cfg.data_dir)
+    import os as _os
+    capability = CapabilityProbe(_os.path.join(cfg.data_dir, "env.json"))
 
     # 通用披露+执行工具（tools + mcp 统一）
     guide = ToolGuideTool(loaded["tree"], capability=capability)
@@ -362,6 +363,44 @@ def cmd_sessions_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sessions_stats(args: argparse.Namespace) -> int:
+    """显示会话执行度量报告（工具调用次数、耗时等）。"""
+    from cagent.config import ConfigProvider
+    from cagent.metrics import MetricsService, JsonlMetricsBackend
+    from cagent.storage import get_storage
+
+    # 支持两种格式：位置参数 或 key=value 格式
+    sid = args.session_id
+    if "=" in sid:
+        # 解析 key=value 格式
+        key, value = sid.split("=", 1)
+        if key == "session_id":
+            sid = value
+        else:
+            print(f"错误: 不支持的参数格式 '{sid}'，请使用 'session_id=<id>' 或直接提供 ID")
+            return 1
+    
+    cfg = ConfigProvider(args.config, watch=False) if args.config else ConfigProvider(watch=False)
+    
+    # 直接使用 data_dir 构造存储后端
+    storage = get_storage(cfg.data_dir)
+    
+    # 获取存储根目录
+    storage_root = getattr(storage, "root", None)
+    if not storage_root:
+        print(f"错误: 无法获取存储根目录")
+        return 1
+    
+    # 构造度量服务
+    backend = JsonlMetricsBackend(storage_root)
+    service = MetricsService(backend)
+    
+    # 生成并打印报告
+    report = service.format_report(sid)
+    print(report)
+    return 0
+
+
 # ---------- memory 管理子命令 ----------
 
 def _memory_store(args: argparse.Namespace):
@@ -467,6 +506,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sess_show = sess_sub.add_parser("show", help="显示会话详情（步骤状态、依赖关系、执行结果）")
     p_sess_show.add_argument("session_id", help="要查看的会话 ID")
     p_sess_show.set_defaults(func=cmd_sessions_show)
+    p_sess_stats = sess_sub.add_parser("stats", help="显示会话执行度量报告（工具调用次数、耗时等）")
+    p_sess_stats.add_argument("session_id", help="要查看度量的会话 ID")
+    p_sess_stats.set_defaults(func=cmd_sessions_stats)
 
     p_mem = sub.add_parser("memory", help="长期记忆管理")
     p_mem.add_argument("--data-dir", default=None, help="指定数据目录（默认 .data）")
