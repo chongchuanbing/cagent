@@ -575,14 +575,15 @@ class ShellExecutor:
                         actual_path = parts[1].strip()
                         break
             
-            hint = "请检查路径是否正确，用 ls 或 fd 确认文件存在"
+            # hint 按实际错误特征分派：自然描述发生了什么，不做硬性流程指令
             if actual_path:
-                hint += f"\n实际尝试的路径: {actual_path}"
-                # 检查是否是相对路径拼接错误
+                hint = f"路径不存在: {actual_path}"
+                # 检查是否是相对路径拼接错误（工作目录被错误拼接）
                 if self.work_dir in actual_path:
                     relative_part = actual_path.replace(self.work_dir, '').lstrip('/')
-                    hint += f"\n（相对路径被拼接为: {self.work_dir}/{relative_part}）"
-                    hint += "\n提示：如果路径层级不对，可能是相对路径前缀错误，请检查"
+                    hint += f"\n（路径被拼接为 {self.work_dir}/{relative_part}，可能是相对路径前缀有误）"
+            else:
+                hint = "目标文件或目录不存在，请确认路径正确"
             
             return ToolResult(
                 ok=False, content=content,
@@ -619,12 +620,12 @@ class ShellExecutor:
                 hint=hint,
             )
 
-        # 默认：通用执行错误
+        # 默认：通用执行错误——按退出码给出事实描述
         return ToolResult(
             ok=False, content=content,
             error=f"退出码 {result.returncode}",
             error_kind="EXEC_ERROR",
-            hint="命令执行失败，请检查参数和路径径是否正确",
+            hint=f"命令执行失败，退出码 {result.returncode}",
         )
 
     def _truncate(self, text: str) -> str:

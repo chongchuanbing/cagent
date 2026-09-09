@@ -139,6 +139,7 @@ def _build_agent(config_path: Optional[str] = None, emitter=None):
         loaded["tree"], loaded["executors"],
         shell_executor=shell_executor,
         mcp_manager=mcp_manager,
+        emitter=emitter,
     )
 
     # 加载 Skills（多目录扫描 SKILL.md 标准）
@@ -220,7 +221,144 @@ def cmd_sessions_list(args: argparse.Namespace) -> int:
     for k in metas:
         meta = storage.read_json(k) or {}
         sid = k.split("/")[1]
-        print(f"{sid}  [{meta.get('status', '?')}]  {meta.get('goal', '')}")
+        status = meta.get('status', '?')
+        goal = meta.get('goal', '')
+        # 显示步骤统计
+        plan = storage.read_json(f"sessions/{sid}/plan.json") or {}
+        steps = plan.get('steps', [])
+        if steps:
+            done = sum(1 for s in steps if s.get('status') == 'done')
+            failed = sum(1 for s in steps if s.get('status') == 'failed')
+            pending = sum(1 for s in steps if s.get('status') == 'pending')
+            stats = f" ({done}✓ {failed}✗ {pending}⏳)" if (done or failed or pending) else ""
+            status_display = status
+            if status == 'running' and done + failed < len(steps):
+                status_display = f"{status} (中断)"
+            print(f"{sid}  [{status_display}]{stats}  {goal}")
+        else:
+            print(f"{sid}  [{status}]  {goal}")
+    return 0
+
+
+def cmd_sessions_show(args: argparse.Namespace) -> int:
+    """显示单个会话的详细信息，包括每个步骤的执行状态、依赖关系和结果摘要。"""
+    from cagent.config import ConfigProvider
+    from cagent.storage import get_storage
+
+    sid = args.session_id
+    cfg = ConfigProvider(args.config, watch=False) if args.config else ConfigProvider(watch=False)
+    path_space = cfg.build_path_space()
+    storage = get_storage(cfg.data_dir, path_space=path_space)
+
+    # 读取元信息
+    meta = storage.read_json(f"sessions/{sid}/meta.json") or {}
+    if not meta:
+        print(f"错误: 会话 {sid} 不存在")
+        return 1
+
+    goal = meta.get('goal', '')
+    status = meta.get('status', 'unknown')
+    created = meta.get('created_at', '')
+    finished = meta.get('finished_at', '')
+
+    # 读取计划
+    plan = storage.read_json(f"sessions/{sid}/plan.json") or {}
+    steps = plan.get('steps', [])
+
+    # 分析步骤状态
+    done_steps = [s for s in steps if s.get('status') == 'done']
+    failed_steps = [s for s in steps if s.get('status') == 'failed']
+    pending_steps = [s for s in steps if s.get('status') == 'pending']
+
+    # 输出头部信息
+    print("=" * 70)
+    print(f"会话 ID:  {sid}")
+    print(f"目标:     {goal}")
+    print(f"状态:     {status}")
+    print(f"创建时间: {created}")
+    if finished:
+        print(f"结束时间: {finished}")
+    print(f"步骤统计: {len(done_steps)} 完成 / {len(failed_steps)} 失败 / {len(pending_steps)} 待执行 / {len(steps)} 总计")
+    print("=" * 70)
+
+    if not steps:
+        print("\n（无步骤信息）")
+        return 0
+
+    # 输出每个步骤的详细信息
+    print("\n步骤详情:")
+    for i, step in enumerate(steps, 1):
+        step_id = step.get('id', f'step_{i}')
+        step_status = step.get('status', 'unknown')
+        description = step.get('description', '')
+        depends_on = step.get('depends_on', [])
+
+        # 状态图标
+        status_icons = {
+            'done': '✓',
+            'failed': '✗',
+            'pending': '⏳',
+            'running': '🔄',
+            'skipped': '⏭️'
+        }
+        icon = status_icons.get(step_status, '?')
+
+        # 依赖关系
+        dep_str = f" (依赖: {', '.join(depends_on)})" if depends_on else ""
+
+        print(f"\n{i}. {icon} [{step_id}] {description}{dep_str}")
+        print(f"   状态: {step_status}")
+
+        # 结果信息
+        result = step.get('result')
+        if result:
+            success = result.get('success')
+            output = result.get('output', '')
+            error = result.get('error', '')
+
+            if success:
+                # 截取输出摘要
+                output_preview = output[:200] + ('...' if len(output) > 200 else '')
+                print(f"   结果: 成功")
+                if output_preview:
+                    print(f"   输出: {output_preview}")
+            else:
+                print(f"   结果: 失败")
+                if error:
+                    print(f"   错误: {error}")
+                if output:
+                    output_preview = output[:150] + ('...' if len(output) > 150 else '')
+                    print(f"   输出: {output_preview}")
+        elif step_status == 'pending':
+            # 检查为什么是 pending
+            if depends_on:
+                done_ids = {s.get('id') for s in steps if s.get('status') == 'done'}
+                missing_deps = [d for d in depends_on if d not in done_ids]
+                if missing_deps:
+                    print(f"   ⚠️  未执行: 依赖步骤未完成 ({', '.join(missing_deps)})")
+                elif status == 'running':
+                    print(f"   ⚠️  未执行: 会话中断")
+                else:
+                    print(f"   ⚠️  未执行")
+            else:
+                if status == 'running':
+                    print(f"   ⚠️  未执行: 会话中断")
+                else:
+                    print(f"   ⚠️  未执行")
+
+    # 输出依赖图（如果有依赖关系）
+    has_deps = any(step.get('depends_on') for step in steps)
+    if has_deps:
+        print("\n" + "=" * 70)
+        print("依赖关系图:")
+        for step in steps:
+            step_id = step.get('id')
+            depends_on = step.get('depends_on', [])
+            if depends_on:
+                for dep in depends_on:
+                    print(f"  {dep} → {step_id}")
+
+    print("=" * 70)
     return 0
 
 
@@ -326,6 +464,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sess = sub.add_parser("sessions", help="会话管理")
     sess_sub = p_sess.add_subparsers(dest="sess_command", required=True)
     sess_sub.add_parser("list", help="列出历史会话").set_defaults(func=cmd_sessions_list)
+    p_sess_show = sess_sub.add_parser("show", help="显示会话详情（步骤状态、依赖关系、执行结果）")
+    p_sess_show.add_argument("session_id", help="要查看的会话 ID")
+    p_sess_show.set_defaults(func=cmd_sessions_show)
 
     p_mem = sub.add_parser("memory", help="长期记忆管理")
     p_mem.add_argument("--data-dir", default=None, help="指定数据目录（默认 .data）")

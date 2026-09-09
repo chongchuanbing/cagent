@@ -65,6 +65,7 @@ class SkillGuideTool(Tool):
         "先调本工具查看技能指令，再调 run_skill 执行。"
     )
     group = "default"
+    source = "skill"
 
     def __init__(self, skills: Dict[str, SkillDefinition]):
         self._skills = skills
@@ -133,6 +134,7 @@ class RunSkillTool(Tool):
         "技能指令会注入到上下文中，请按指令自主编排调用其他工具（如 run_tool）。"
     )
     group = "default"
+    source = "skill"
 
     def __init__(self, skills: Dict[str, SkillDefinition]):
         self._skills = skills
@@ -226,6 +228,7 @@ class ReadSkillFileTool(Tool):
         "先传目录列出清单再选择，切勿拼造或猜测文件名，也不要自行拼接绝对路径。"
     )
     group = "default"
+    source = "skill"
 
     def __init__(self, skills: Dict[str, SkillDefinition], path_space=None):
         self._skills = skills
@@ -326,7 +329,7 @@ class ReadSkillFileTool(Tool):
             content="",
             error="\n".join(lines),
             error_kind="SANDBOX",
-            hint="不要继续猜测其他文件名；先列目录或改用上面返回的候选路径。",
+            hint="上述候选路径为技能目录下真实存在的文件",
         )
 
     def schema(self) -> dict:

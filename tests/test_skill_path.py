@@ -98,7 +98,7 @@ def test_read_skill_file_missing_returns_candidates(tmp_path):
     assert not res.ok
     assert "component-svg.md" in res.error  # 相近候选回传
     assert "references/" in res.error  # 引导先列目录
-    assert res.hint and "不要" in res.hint
+    assert res.hint and "候选" in res.hint
 
 
 def test_read_skill_file_list_dir(tmp_path):

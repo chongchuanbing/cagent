@@ -246,9 +246,9 @@ class ReActEngine:
                         {"doom_loop_warning": doom_warning, "tool": name, "args": args}
                     )
 
-                # L5: 检查是否应该继续重试该工具
-                if self._failure_ledger and not self._failure_ledger.should_retry(name):
-                    obs_content = f"工具 {name} 已达到最大重试次数（{self._failure_ledger.max_retries_per_tool}），停止重试。\n建议：{self._failure_ledger.get_retry_hint(name)}"
+                # L5: 检查是否应该继续重试该工具（按 args 细粒度熔断）
+                if self._failure_ledger and not self._failure_ledger.should_retry(name, args):
+                    obs_content = f"工具 {name} 已达到最大重试次数（{self._failure_ledger.max_retries_per_tool}），停止重试。\n建议：{self._failure_ledger.get_retry_hint(name, args)}"
                     ok = False
                     self._emit(EventType.TOOL_RESULT, {"name": name, "content": obs_content, "ok": ok}, step_id=step.id)
                     # 熔断回合同样落 trace，保证 UI 与 trace.jsonl 一致（可审计）
@@ -288,7 +288,9 @@ class ReActEngine:
                     return StepResult(step_id=step.id, success=False, output="", error="触发熔断")
 
                 tool = available.get(name)
-                self._emit(EventType.TOOL_CALL, {"name": name, "args": args}, step_id=step.id)
+                # 获取工具来源（source 字段，默认 "builtin"）
+                tool_source = getattr(tool, "source", "builtin") if tool else "builtin"
+                self._emit(EventType.TOOL_CALL, {"name": name, "args": args, "source": tool_source}, step_id=step.id)
                 if tool is None:
                     obs_content = f"错误：工具 {name} 在本步骤不可用（未启用或未入选）"
                     ok = False
@@ -311,13 +313,13 @@ class ReActEngine:
                     else:
                         obs_content = result.content
 
-                # L5: 记录失败
+                # L5: 记录失败（按 args 细粒度计数）
                 if not ok and self._failure_ledger:
-                    self._failure_ledger.record_failure(name, error_kind)
+                    self._failure_ledger.record_failure(name, error_kind, args=args)
                     # 在观察结果中附加提示
                     if not obs_content.endswith("\n"):
                         obs_content += "\n"
-                    obs_content += f"💡 {self._failure_ledger.get_retry_hint(name)}"
+                    obs_content += f"💡 {self._failure_ledger.get_retry_hint(name, args)}"
 
                 self._emit(
                     EventType.TOOL_RESULT,

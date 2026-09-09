@@ -51,6 +51,8 @@ class AgentLoop:
     def _run(self, goal: str, recorder=None, session_id: Optional[str] = None, memory=None, prior_history: List[dict] = None) -> str:
         if recorder:
             recorder.record_meta(goal)
+        # 度量采集：标记 turn 开始
+        self._emit(EventType.TURN_STARTED, {"goal": goal}, session_id=session_id)
         # 长期记忆召回：作为上下文前缀注入每个 step（不受 history 窗口淘汰影响）
         memory_prefix: List[dict] = []
         if memory is not None:
@@ -152,6 +154,9 @@ class AgentLoop:
                     )
                 except Exception:  # noqa: BLE001
                     pass
+
+        # 度量采集：标记 turn 结束
+        self._emit(EventType.TURN_FINISHED, {"status": "done"}, session_id=session_id)
 
         return answer
 

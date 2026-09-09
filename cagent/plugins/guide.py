@@ -153,11 +153,13 @@ class RunToolTool(Tool):
         executors: Optional[Dict[str, "PluginExecutor"]] = None,
         shell_executor: Optional[ShellExecutor] = None,
         mcp_manager: Optional[McpClientManager] = None,
+        emitter=None,
     ):
         self._tree = tree
         self._executors = executors or {}
         self._shell = shell_executor
         self._mcp = mcp_manager
+        self._emitter = emitter
 
     def set_executors(self, executors: dict) -> None:
         self._executors = executors
@@ -199,6 +201,17 @@ class RunToolTool(Tool):
 
         # 按 execute.mode 分发
         mode = node.execute.get("mode", "executor") if node.execute else "executor"
+        # 度量采集：emit 真实工具执行事件（区分 source）
+        if self._emitter is not None:
+            from ..events.schema import EventType
+            source_map = {"executor": "plugin", "shell": "shell", "mcp": "mcp"}
+            self._emitter.emit(
+                EventType.REAL_TOOL_EXEC,
+                {
+                    "real_tool_name": path,
+                    "source": source_map.get(mode, "plugin"),
+                },
+            )
         if mode == "executor":
             return self._exec_executor(node, params)
         elif mode == "shell":

@@ -28,6 +28,9 @@ class EventType(str, Enum):
     FINAL_ANSWER = "final_answer"        # 最终答案
     ERROR = "error"                      # 运行错误
     DOOM_LOOP_DETECTED = "doom_loop_detected"  # 死循环检测触发
+    TURN_STARTED = "turn_started"        # 一次 run() 调用开始
+    TURN_FINISHED = "turn_finished"      # 一次 run() 调用结束
+    REAL_TOOL_EXEC = "real_tool_exec"    # 真实工具执行（run_tool 代理内部，区分 builtin/plugin/mcp/shell）
 
 
 class AgentEvent(BaseModel):

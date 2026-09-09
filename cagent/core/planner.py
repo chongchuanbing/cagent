@@ -49,10 +49,42 @@ class Planner:
 
     def _build_plan(self, raw_text: str, goal: str) -> Plan:
         data = _extract_json_block(raw_text)
-        steps_raw = data.get("steps", []) if isinstance(data, dict) else []
+        
+        # 类型检查：确保 data 是字典
+        if not isinstance(data, dict):
+            # 如果 data 是字符串，尝试解析
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                    if not isinstance(data, dict):
+                        raise ValueError(f"计划 JSON 格式错误：期望字典，实际得到 {type(data).__name__}")
+                except json.JSONDecodeError:
+                    raise ValueError(f"计划 JSON 格式错误：无法解析字符串为 JSON")
+            else:
+                raise ValueError(f"计划 JSON 格式错误：期望字典，实际得到 {type(data).__name__}")
+        
+        steps_raw = data.get("steps", [])
+        
+        # 类型检查：确保 steps 是列表
+        if not isinstance(steps_raw, list):
+            raise ValueError(f"计划 JSON 格式错误：'steps' 字段应为列表，实际得到 {type(steps_raw).__name__}")
+        
         steps: List[Step] = []
         used_ids: set = set()
         for idx, s in enumerate(steps_raw, start=1):
+            # 类型检查：确保每个 step 是字典
+            if not isinstance(s, dict):
+                # 如果是字符串，尝试解析
+                if isinstance(s, str):
+                    try:
+                        s = json.loads(s)
+                        if not isinstance(s, dict):
+                            raise ValueError(f"计划 JSON 格式错误：第 {idx} 个步骤应为字典，实际得到 {type(s).__name__}: {s}")
+                    except json.JSONDecodeError:
+                        raise ValueError(f"计划 JSON 格式错误：第 {idx} 个步骤无法解析为 JSON 对象")
+                else:
+                    raise ValueError(f"计划 JSON 格式错误：第 {idx} 个步骤应为字典，实际得到 {type(s).__name__}: {s}")
+            
             sid = s.get("id") or f"s{idx}"
             if sid in used_ids:
                 sid = f"{sid}_{idx}"

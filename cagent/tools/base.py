@@ -28,6 +28,7 @@ class Tool(ABC):
     name: str = ""
     description: str = ""
     group: str = "default"
+    source: str = "builtin"           # 工具来源标记：builtin / plugin / mcp / skill / shell
     requires: Optional[dict] = None  # L3 环境裁剪：{"cli": "fd", "fallback": "find"}
 
     @abstractmethod

@@ -190,6 +190,69 @@ def test_unconverged_step_returns_failure():
     assert "尚未完成文件写入" in result.output
 
 
+def test_fine_grained_different_args_do_not_cross_contaminate():
+    """细粒度：同工具不同参数独立计数——A 文件不存在不影响 B 文件的预算。
+
+    回归场景：会话 f4ec3799 中 shell.sed 读 cagent/clients/cli/main.py 失败 3 次
+    后，连 clients/cli/main.py（正确路径）也被熔断。按 args 细粒度后不应再出现。
+    """
+    ledger = FailureLedger(soft_max_retries=3)
+
+    # shell.sed 读文件 A 连续失败 3 次
+    args_a = {"file": "cagent/clients/cli/main.py", "start_line": 1, "end_line": 80}
+    for _ in range(3):
+        ledger.record_failure("shell.sed", "EXEC_ERROR", args=args_a)
+
+    # 文件 A 达到细粒度上限 → 熔断
+    assert ledger.should_retry("shell.sed", args=args_a) is False
+
+    # 文件 B 完全不受影响 → 仍可重试
+    args_b = {"file": "clients/cli/main.py", "start_line": 1, "end_line": 80}
+    assert ledger.should_retry("shell.sed", args=args_b) is True
+
+    # 文件 B 失败一次后仍然可用（独立计数，只到了 1/3）
+    ledger.record_failure("shell.sed", "EXEC_ERROR", args=args_b)
+    assert ledger.should_retry("shell.sed", args=args_b) is True
+
+
+def test_coarse_grain_still_limits_same_args():
+    """粗粒度兜底：完全相同的 (tool, args) 反复调用仍然会被兜底熔断。"""
+    ledger = FailureLedger(soft_max_retries=3)
+    same_args = {"file": "foo.py", "start_line": 1, "end_line": 10}
+
+    for _ in range(3):
+        ledger.record_failure("shell.sed", "EXEC_ERROR", args=same_args)
+
+    # 细粒度 3/3 → 熔断
+    assert ledger.should_retry("shell.sed", args=same_args) is False
+
+
+def test_no_args_fallback_to_tool_level():
+    """不传 args 时回退到 tool_name 级粒度（向后兼容）。"""
+    ledger = FailureLedger(max_retries_per_tool=2)
+    ledger.record_failure("run_tool", "TOOL_UNAVAILABLE")
+    ledger.record_failure("run_tool", "TOOL_UNAVAILABLE")
+    assert ledger.should_retry("run_tool") is False
+    # 不传 args 的查询也走粗粒度
+    assert ledger.should_retry("run_tool", args=None) is False
+
+
+def test_ledger_serialization_roundtrip():
+    """序列化/反序列化后细粒度数据完整。"""
+    ledger = FailureLedger(soft_max_retries=3)
+    args = {"file": "foo.py"}
+    ledger.record_failure("shell.sed", "EXEC_ERROR", args=args)
+    ledger.record_failure("run_tool", "TIMEOUT")
+
+    data = ledger.to_dict()
+    restored = FailureLedger.from_dict(data)
+
+    assert restored.should_retry("shell.sed", args=args) is True
+    assert restored.get_failure_count("shell.sed", args=args) == 1
+    assert restored.get_failure_count("run_tool") == 1
+    assert restored.get_last_error_kind("shell.sed", args=args) == "EXEC_ERROR"
+
+
 def test_circuit_break_round_written_to_trace():
     """熔断回合写入 last_trace：UI 与 trace.jsonl 一致，可事后审计。"""
     # tool_missing 未注册 → 走 TOOL_UNAVAILABLE 硬错误分支

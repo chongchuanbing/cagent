@@ -58,6 +58,17 @@ class SessionRecorder:
         meta["workspace_writes"] = writes
         self.storage.write_json(f"{self._prefix}/meta.json", meta)
 
+    def record_metrics(self, turn_metrics) -> None:
+        """记录单次 turn 的度量数据（追加写入 metrics.jsonl）。
+
+        Args:
+            turn_metrics: TurnMetrics 对象，包含本次 run 的完整统计
+        """
+        self.storage.append_line(
+            f"{self._prefix}/metrics.jsonl",
+            turn_metrics.model_dump_json()
+        )
+
     # ── 会话恢复 ──────────────────────────────────────────
 
     def load_meta(self) -> dict:

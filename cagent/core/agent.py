@@ -11,12 +11,16 @@ from ..config.schema import PathSpaceConfig
 from ..events import EventEmitter
 from ..memory import MemoryService
 from ..utils import sanitize_text
+from ..utils.logging import get_logger, setup_session_logger, teardown_session_logger
 from ..plugins.capability import CapabilityProbe
 from .failure_ledger import FailureLedger
 from .planner import Planner
 from .react import ReActEngine
 from .executor import Executor
 from .loop import AgentLoop
+from ..metrics import MetricsCollector, JsonlMetricsBackend
+
+logger = get_logger("agent")
 
 
 def _default_llm_factory(llm_config: LLMConfig) -> LLMClient:
@@ -74,6 +78,13 @@ class Agent:
 
         # L5 失败账本：显式注入优先；否则自动构建
         self.failure_ledger = failure_ledger if failure_ledger is not None else FailureLedger()
+
+        # 度量采集：显式注入优先；否则自动构建
+        self.metrics_collector = MetricsCollector()
+        
+        # 订阅 MetricsCollector 到 emitter
+        if self.emitter is not None:
+            self.emitter.subscribe(self.metrics_collector.handle_event)
 
         self._loop = loop
         self._planner = planner
@@ -248,6 +259,7 @@ class Agent:
         if resume:
             prior_history = recorder.load_history()
 
+        # 执行任务
         if scope is not None:
             from contextlib import ExitStack
 
@@ -255,11 +267,19 @@ class Agent:
 
             with ExitStack() as stack:
                 stack.enter_context(enter_scope(scope))
-                return loop.run(
+                result = loop.run(
                     goal, recorder=recorder, session_id=sid,
                     memory=self.memory, prior_history=prior_history,
                 )
-        return loop.run(
-            goal, recorder=recorder, session_id=sid,
-            memory=self.memory, prior_history=prior_history,
-        )
+        else:
+            result = loop.run(
+                goal, recorder=recorder, session_id=sid,
+                memory=self.memory, prior_history=prior_history,
+            )
+        
+        # 保存度量数据
+        turn_metrics = self.metrics_collector.get_current_turn()
+        if turn_metrics is not None:
+            recorder.record_metrics(turn_metrics)
+        
+        return result
