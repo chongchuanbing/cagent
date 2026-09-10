@@ -16,6 +16,18 @@ class LLMConfig:
     temperature: float = 0.0
     max_tokens: int = 2048
     data_dir: str = ".data"
+    # —— 模型上下文上限（来自 models.json 的 maxInputTokens）——
+    # 用于 history 窗口的 token 预算裁剪：history 部分占用不超过
+    # max_input_tokens * history_token_budget_ratio，超出则淘汰最旧条目。
+    max_input_tokens: Optional[int] = None
+    # —— 多模型能力声明（带默认值，旧调用零改动）——
+    tool_calling: bool = True
+    vision: bool = False
+    reasoning_enabled: bool = False
+    reasoning_effort: Optional[str] = None
+    reasoning_budget_tokens: Optional[int] = None
+    reasoning_extra_body: dict = field(default_factory=dict)
+    vendor: str = "openai"
 
 
 @dataclass

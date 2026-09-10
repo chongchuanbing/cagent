@@ -4,6 +4,7 @@ import uuid
 from typing import Callable, Optional
 
 from ..llm.base import LLMClient, LLMConfig
+from ..llm.registry import ModelRouter
 from ..tools.registry import ToolRegistry
 from ..storage import get_storage, SessionRecorder
 from ..config.provider import ConfigProvider
@@ -37,12 +38,15 @@ class Agent:
       与提示词「保存后立即生效」，无需重启。
     - 传入 `storage` 时，每次 run 自动创建 session 并落盘 meta/plan/trace。
     - 也可显式注入 planner/react/executor/loop 以完全自定义。
+    - 多模型：传 `model_router` 启用多模型路由；`run(model=<id>)` 覆盖本次默认。
+      旧用法传 `llm=` 仍受支持（单模型，等价于只含该 client 的 router）。
     """
 
     def __init__(
         self,
         tools: ToolRegistry,
         llm: Optional[LLMClient] = None,
+        model_router: Optional[ModelRouter] = None,
         config: Optional[ConfigProvider] = None,
         storage=None,
         planner: Optional[Planner] = None,
@@ -60,6 +64,8 @@ class Agent:
     ):
         self.tools = tools
         self._llm = llm
+        self._model_router = model_router
+        self._active_model: Optional[str] = None
         self.config = config
         # path_space 必须先于 storage 就位：storage 注入它做统一越界校验
         self.path_space = path_space
@@ -81,7 +87,7 @@ class Agent:
 
         # 度量采集：显式注入优先；否则自动构建
         self.metrics_collector = MetricsCollector()
-        
+
         # 订阅 MetricsCollector 到 emitter
         if self.emitter is not None:
             self.emitter.subscribe(self.metrics_collector.handle_event)
@@ -100,12 +106,19 @@ class Agent:
         cache_path = os.path.join(data_dir, "env.json")
         return CapabilityProbe(cache_path=cache_path)
 
-    def _resolve_llm(self) -> LLMClient:
+    def _model_router_or_build(self) -> Optional[ModelRouter]:
+        """返回 model_router；若未显式注入但存在 config，则按 config 惰性构建。"""
+        if self._model_router is None and self.config is not None:
+            self._model_router = ModelRouter.from_config(self.config, self._llm_factory)
+        return self._model_router
+
+    def _resolve_llm(self, model: Optional[str] = None) -> LLMClient:
         if self._llm is not None:
             return self._llm
-        if self.config is None:
-            raise ValueError("必须提供 llm 或 config")
-        return self._llm_factory(self.config.get_model_config())
+        router = self._model_router_or_build()
+        if router is not None:
+            return router.get(model)
+        raise ValueError("必须提供 llm / model_router / config")
 
     def _effective_max_steps(self) -> int:
         if self._max_steps is not None:
@@ -187,10 +200,10 @@ class Agent:
         )
         return session_space, scope
 
-    def _build_loop(self, path_space=None) -> AgentLoop:
+    def _build_loop(self, path_space=None, model=None) -> AgentLoop:
         if self._loop is not None:
             return self._loop
-        llm = self._resolve_llm()
+        llm = self._resolve_llm(model)
         react = self._react_engine or ReActEngine(
             llm, self.tools, config=self.config,
             max_iterations=self._effective_react_max_iterations(),
@@ -228,6 +241,7 @@ class Agent:
         session_id: Optional[str] = None,
         resume: bool = False,
         space_dir: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> str:
         """执行目标任务，返回最终答案；过程落盘到 sessions/<session_id>/。
 
@@ -235,6 +249,8 @@ class Agent:
           让新 goal 带着上轮的结论与工具观察继续执行。
         - space_dir 覆盖配置 paths.space_dir（空间模式：workspace:// 挂该目录，
           结构化工具写入需显式 scheme 并登记审计；临时文件始终落会话目录）。
+        - model 覆盖本次 run 使用的模型 id（需在 models.json 中已配置）；
+          不传则使用默认模型。
         """
         # 终端在非 UTF-8 环境下粘贴的内容会带 \udcXX 代理字符，
         # 不清洗的话落盘/JSON 序列化会报 surrogates not allowed
@@ -244,7 +260,18 @@ class Agent:
         sid = session_id or uuid.uuid4().hex
         # 会话路径作用域：scratch 目录创建 + session:// / workspace:// 派生挂载
         session_space, scope = self._prepare_session_scope(sid, space_dir)
-        loop = self._build_loop(path_space=session_space)
+        # 启动期护栏：ReAct 角色目标必须支持工具调用
+        # 显式传入 llm 的旧单模型用法优先，跳过 router 校验
+        if self._llm is not None:
+            self._active_model = None
+        else:
+            router = self._model_router_or_build()
+            if router is not None:
+                router.validate_react_target(model)
+                self._active_model = model or router.default
+            else:
+                self._active_model = None
+        loop = self._build_loop(path_space=session_space, model=self._active_model)
         if self.emitter is not None:
             self.emitter.default_session_id = sid
         # remember 工具若已注册但未绑定记忆服务，在此绑定（支持 CLI 构造后注册的场景）
@@ -321,12 +348,12 @@ class Agent:
         finally:
             logger.info(f"会话结束 session_id={sid}")
             teardown_session_logger()
-        
+
         # 保存度量数据
         turn_metrics = self.metrics_collector.get_current_turn()
         if turn_metrics is not None:
             recorder.record_metrics(turn_metrics)
-        
+
         return result
 
     def run_interrupted(

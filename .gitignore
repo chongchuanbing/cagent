@@ -28,3 +28,4 @@ cagent/skills/tencent-pptx
 cagent/skills/agent-browser
 clients/web/frontend/node_modules
 cagent/skills/tencent-local-office-edit
+models.json

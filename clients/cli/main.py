@@ -1,7 +1,9 @@
 """cagent 命令行客户端。
 
 子命令：
-  run <goal>             运行 Agent（自动加载 config/agent.yaml + storage 落盘）
+  run <goal>             运行 Agent（自动加载 config/agent.yaml + config/models.json + storage 落盘）
+  run --model <id>       指定本次运行使用的模型（覆盖默认）
+  models list            列出已配置模型（id/name/vendor/能力开关/默认）
   config show            打印当前生效配置
   config set <key> <val> 修改 agent.yaml 的某项配置（保存即生效）
   sessions list          列出 .data 下的历史会话
@@ -12,7 +14,8 @@
 
 示例：
   python -m clients.cli run "帮我算 12 * 13"
-  python -m clients.cli config set model.temperature 0.7
+  python -m clients.cli run "用强模型重做" --model qwen3.7-plus
+  python -m clients.cli models list
   python -m clients.cli config set max_steps 10
   python -m clients.cli memory list --status candidate
 """
@@ -176,7 +179,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     emitter.subscribe(create_display_handler())
     agent, _ = _build_agent(args.config, emitter=emitter)
     agent.run(args.goal, session_id=args.session_id, resume=args.resume,
-              space_dir=getattr(args, "space", None))
+              space_dir=getattr(args, "space", None), model=getattr(args, "model", None))
     # 最终答案已由 FINAL_ANSWER 事件渲染，无需重复 print
     return 0
 
@@ -475,6 +478,28 @@ def cmd_memory_tag(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_models_list(args: argparse.Namespace) -> int:
+    """列出 models.json 中已配置的模型。"""
+    from cagent.config import ConfigProvider
+
+    cfg = ConfigProvider(args.config, watch=False) if args.config else ConfigProvider(watch=False)
+    mf = cfg.get_models_file()
+    if not mf.models:
+        print("（未配置任何模型，请在 config/models.json 中添加）")
+        return 0
+    default = cfg.get_default_model()
+    print(f"{'ID':<22} {'NAME':<26} {'VENDOR':<10} TOOL VISION REASON DEFAULT")
+    for m in mf.models:
+        flag = "★" if m.model == default else " "
+        print(
+            f"{m.model:<22} {(m.name or ''):<26} {m.vendor:<10} "
+            f"{'Y' if m.tool_calling else '-'} "
+            f"{'Y' if m.vision else '-'} "
+            f"{'Y' if m.reasoning.enabled else '-'}      {flag}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cagent", description="cagent 命令行客户端")
     parser.add_argument("--config", default=None, help="指定 agent.yaml 路径（默认 config/agent.yaml）")
@@ -485,6 +510,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--session-id", default=None, help="指定会话 ID（用于回放/续跑）")
     p_run.add_argument("--resume", action="store_true", default=False, help="从指定会话的历史上下文继续执行")
     p_run.add_argument("--space", default=None, help="项目空间目录（如代码仓库根）；未指定时所有生成文件落会话目录")
+    p_run.add_argument("--model", default=None, help="指定运行模型 id（覆盖默认）；见 `cagent models list`")
     p_run.set_defaults(func=cmd_run)
 
     p_chat = sub.add_parser("chat", help="交互式会话模式")
@@ -527,6 +553,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_tag.add_argument("id", help="记忆 ID")
     p_tag.add_argument("tags", nargs="+", help="标签键值对，如 主题=偏好")
     p_tag.set_defaults(func=cmd_memory_tag)
+
+    p_models = sub.add_parser("models", help="模型管理（models.json）")
+    models_sub = p_models.add_subparsers(dest="models_command", required=True)
+    models_sub.add_parser("list", help="列出已配置模型（id/name/vendor/能力/默认）").set_defaults(
+        func=cmd_models_list
+    )
 
     return parser
 

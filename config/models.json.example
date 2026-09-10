@@ -1,0 +1,42 @@
+{
+  "default": "default-model",
+  "models": [
+    {
+      "id": "default-model",
+      "name": "Default Model",
+      "vendor": "OpenAI",
+      "url": "https://api.openai.com/v1",
+      "apiKey": "${OPENAI_API_KEY}",
+      "supportsToolCall": true,
+      "supportsImages": false,
+      "supportsReasoning": false,
+      "maxInputTokens": 128000,
+      "maxOutputTokens": 4096
+    },
+    {
+      "id": "glm-5.2",
+      "name": "GLM-5.2 (DashScope)",
+      "vendor": "Custom",
+      "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "${DASHSCOPE_API_KEY}",
+      "supportsToolCall": true,
+      "supportsImages": false,
+      "supportsReasoning": true,
+      "reasoning": { "effort": "high", "budgetTokens": 8000, "extraBody": {} },
+      "maxInputTokens": 1024000,
+      "maxOutputTokens": 131072
+    },
+    {
+      "id": "qwen-vl",
+      "name": "Qwen-VL",
+      "vendor": "Qwen",
+      "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "${DASHSCOPE_API_KEY}",
+      "supportsToolCall": true,
+      "supportsImages": true,
+      "supportsReasoning": false,
+      "maxInputTokens": 128000,
+      "maxOutputTokens": 8192
+    }
+  ]
+}

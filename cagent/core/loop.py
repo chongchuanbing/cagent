@@ -1,4 +1,5 @@
 """AgentLoop：外层编排控制，串联 Plan-Executor 与 ReAct。"""
+import re
 import traceback
 from typing import List, Optional
 
@@ -17,6 +18,24 @@ from .executor import Executor
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# 中文字符按 ~1 token/字、其余按 ~4 字符/1 token 估算（无需外部分词器的近似）。
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_SAFETY_FACTOR = 1.1  # 估算偏宽松，降低真超限风险
+
+
+def estimate_tokens(text: str) -> int:
+    """估算文本的 token 数（中英文混合近似）。
+
+    中文按 1 字 ≈ 1 token；英文/符号按 4 字符 ≈ 1 token；结果再乘安全系数
+    （略微高估），避免估值偏低导致真实上下文超出模型上限。
+    """
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    others = len(text) - cjk
+    return int((cjk + max(1, others // 4)) * _SAFETY_FACTOR)
 
 
 class AgentLoop:
@@ -360,24 +379,65 @@ class AgentLoop:
     def _apply_window(self, history: List[dict]) -> List[dict]:
         """对 history 应用滑动窗口：保留最近 history_window 条完整条目。
 
-        超窗条目按 history_summarize 配置处理：
+        裁剪有两道约束，取更激进者：
+        1. 计数窗口：保留最近 history_window 条；
+        2. token 预算窗口：当 active 模型配置了 maxInputTokens 时，history 部分的
+           估算 token 数不得超过 `max_input_tokens * history_token_budget_ratio`
+           （其余留给 system/goal/step/response），超出则继续淘汰最旧条目。
+
+        被淘汰的条目按 history_summarize 配置处理：
         - True（默认）：与既有摘要一起压缩为一条滚动摘要，置顶保留关键信息；
         - False：直接丢弃（trace.jsonl 已完整落盘，不丢数据）。
         """
         window = self._cfg_value("history_window", 10)
-        if window <= 0:
-            return history
         entries = [h for h in history if "summary" not in h]
         old_summary = next((h["summary"] for h in history if "summary" in h), "")
         evicted: List[dict] = []
-        while len(entries) > window:
-            evicted.append(entries.pop(0))
+
+        # 1) 计数窗口
+        if window > 0:
+            while len(entries) > window:
+                evicted.append(entries.pop(0))
+
+        # 2) token 预算窗口
+        budget = self._history_token_budget()
+        if budget is not None:
+            total = (estimate_tokens(old_summary) if old_summary else 0) + sum(
+                self._entry_tokens(h) for h in entries
+            )
+            # 至少保留 1 条，避免把所有上下文都淘汰掉
+            while len(entries) > 1 and total > budget:
+                total -= self._entry_tokens(entries[0])
+                evicted.append(entries.pop(0))
+
         if not evicted:
             return history
         if not self._cfg_value("history_summarize", True):
             return entries
         summary = self._rollup_summary(old_summary, evicted)
         return ([{"summary": summary}] if summary else []) + entries
+
+    def _max_input_tokens(self) -> Optional[int]:
+        """返回 active 模型的 max_input_tokens（未配置/无 LLM 时返回 None）。"""
+        cfg = getattr(self.llm, "config", None)
+        if cfg is None:
+            return None
+        return getattr(cfg, "max_input_tokens", None)
+
+    def _history_token_budget(self) -> Optional[int]:
+        """返回 history 部分的 token 预算（max_input_tokens * ratio），关闭时返回 None。"""
+        max_in = self._max_input_tokens()
+        if not max_in or max_in <= 0:
+            return None
+        ratio = self._cfg_value("history_token_budget_ratio", 0.6)
+        if ratio <= 0:
+            return None
+        return int(max_in * ratio)
+
+    def _entry_tokens(self, entry: dict) -> int:
+        """估算单个 history 条目（step 结论 + 工具观察）的 token 数。"""
+        parts = [entry.get("description", ""), entry.get("output", "")]
+        return estimate_tokens("\n".join(p for p in parts if p))
 
     def _rollup_summary(self, old_summary: str, evicted: List[dict]) -> str:
         """把被挤出窗口的条目（连同旧摘要）压缩为一条滚动摘要。

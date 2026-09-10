@@ -1,16 +1,8 @@
 # cagent 端上配置：修改保存后立即生效（守护线程每秒热加载，无需重启）
 # 说明：
-# - model:   模型连接参数（provider 预留，当前仅 openai 兼容实现）
+# - 模型配置已迁移至同目录 models.json（UI 落盘格式，cagent 只读）
 # - prompts: 提示词覆盖；key 对应 planner_system / replan_system / react_system
 #            未列出的 key 使用内置默认；react_system 支持 {step} / {tools} 占位符
-
-model:
-  provider: openai
-  model: glm-5.1
-  api_key: xxx        # 也可用环境变量或明文；建议走环境变量
-  base_url: null                    # 兼容第三方 OpenAI 风格端点时填写
-  temperature: 0.0
-  max_tokens: 2048
 
 prompts:
   # planner_system: 覆盖计划生成系统提示
@@ -40,6 +32,9 @@ react_max_iterations: 5        # 单步 ReAct 内最多推理—行动轮数
 history_window: 10             # 注入后续步骤的最近 step 条目数；0 = 不限制
 observation_max_chars: 500     # 单条工具观察注入上下文时的截断长度；0 = 不截断
 history_summarize: true        # 超窗条目是否用 LLM 滚动摘要（false 时直接丢弃；无 LLM 时退化为文本压缩）
+history_token_budget_ratio: 0.6  # history 占 active 模型 maxInputTokens 的预算比例；0 = 关闭 token 预算裁剪（仅按 history_window 计数）
+#   token 预算裁剪：当 models.json 的 maxInputTokens 配置时，history 部分估算 token
+#   不超过 maxInputTokens * 该比例，超出自动淘汰最旧 step（与 history_summarize 联动）
 
 # 工具系统（可选，缺省启用全部分组、不做动态选择）
 tools:

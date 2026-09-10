@@ -1,4 +1,5 @@
 """验证配置系统：加载、环境变量展开、提示词覆盖与保存后热加载。"""
+import json
 import os
 import tempfile
 import time
@@ -13,19 +14,37 @@ def _write(path: str, text: str):
 
 def test_load_model_and_env_expansion(tmp_path):
     os.environ["MY_KEY"] = "secret-123"
-    path = tmp_path / "agent.yaml"
+    agent = tmp_path / "agent.yaml"
+    _write(agent, "prompts:\n  react_system: 'STEP={step}'\n")
+    models = tmp_path / "models.json"
     _write(
-        path,
-        "model:\n"
-        "  model: gpt-4o\n"
-        "  api_key: ${MY_KEY}\n"
-        "  temperature: 0.2\n",
+        models,
+        json.dumps(
+            {
+                "default": "m1",
+                "models": [
+                    {
+                        "id": "m1",
+                        "name": "M1",
+                        "vendor": "OpenAI",
+                        "url": "https://api.openai.com/v1",
+                        "apiKey": "${MY_KEY}",
+                        "supportsToolCall": True,
+                        "supportsImages": False,
+                        "supportsReasoning": False,
+                        "maxOutputTokens": 2048,
+                    }
+                ],
+            }
+        ),
     )
-    p = ConfigProvider(str(path), watch=False)
+    p = ConfigProvider(str(agent), watch=False)
     mc = p.get_model_config()
-    assert mc.model == "gpt-4o"
-    assert mc.api_key == "secret-123"
-    assert mc.temperature == 0.2
+    assert mc.model == "m1"
+    assert mc.api_key == "secret-123"          # ${MY_KEY} 在 models.json 路径展开
+    assert mc.max_tokens == 2048
+    assert p.get_default_model() == "m1"
+    assert p.get_model_names() == ["m1"]
 
 
 def test_prompt_override_and_placeholders(tmp_path):
@@ -43,14 +62,16 @@ def test_prompt_override_and_placeholders(tmp_path):
 
 
 def test_hot_reload_after_save(tmp_path):
-    path = tmp_path / "agent.yaml"
-    _write(path, "model:\n  model: gpt-4o\n")
-    p = ConfigProvider(str(path), watch=False)
-    assert p.get_model_config().model == "gpt-4o"
+    agent = tmp_path / "agent.yaml"
+    _write(agent, "prompts:\n  react_system: 'x'\n")
+    models = tmp_path / "models.json"
+    _write(models, json.dumps({"default": "a", "models": [{"id": "a"}]}))
+    p = ConfigProvider(str(agent), watch=False)
+    assert p.get_default_model() == "a"
 
-    # 修改配置并把 mtime 显式推后，触发重载
-    _write(path, "model:\n  model: gpt-4o-mini\n")
+    # 修改 models.json 并把 mtime 显式推后，触发重载
+    _write(models, json.dumps({"default": "b", "models": [{"id": "b"}]}))
     future = time.time() + 10
-    os.utime(path, (future, future))
+    os.utime(models, (future, future))
     p._maybe_reload()
-    assert p.get_model_config().model == "gpt-4o-mini"
+    assert p.get_default_model() == "b"

@@ -4,15 +4,79 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-class ModelConfig(BaseModel):
-    """模型连接配置，字段对齐 llm.LLMConfig。"""
+class ReasoningConfig(BaseModel):
+    """思考模式配置：能力开关 + 可选强度/预算/原生参数透传。"""
 
-    provider: str = "openai"
-    model: str = "gpt-4o"
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
+    enabled: bool = False
+    effort: Optional[Literal["low", "medium", "high"]] = None
+    budget_tokens: Optional[int] = None
+    extra_body: dict = Field(default_factory=dict)
+
+
+class ModelConfig(BaseModel):
+    """模型连接配置（UI models.json 落盘，cagent 只读）。
+
+    字段对齐 llm.LLMConfig；UI camelCase 经 from_ui_dict 映射为 snake_case。
+    """
+
+    model: str                              # ← UI 的 id（API 模型名 + 路由 key）
+    name: Optional[str] = None             # ← UI 的 name（仅展示）
+    vendor: str = "openai"                 # ← UI 的 vendor（仅驱动 ReasoningAdapter）
+    api_key: Optional[str] = None          # ← UI 的 apiKey（支持 ${ENV}）
+    base_url: Optional[str] = None         # ← UI 的 url
     temperature: float = 0.0
-    max_tokens: int = 2048
+    max_tokens: int = 2048                 # ← UI 的 maxOutputTokens
+    tool_calling: bool = True              # ← UI 的 supportsToolCall
+    vision: bool = False                   # ← UI 的 supportsImages
+    reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
+    max_input_tokens: Optional[int] = None     # ← UI 的 maxInputTokens
+    max_output_tokens: Optional[int] = None
+
+    @classmethod
+    def from_ui_dict(cls, d: dict) -> "ModelConfig":
+        """从 models.json 的单个模型条目（camelCase）构造。
+
+        supportsReasoning → reasoning.enabled；reasoning 子对象合并进 reasoning.*；
+        其余 camelCase → snake_case。useCustomProtocol 字段被忽略（协议恒为 OpenAI 兼容）。
+        """
+        if "id" not in d:
+            raise ValueError(f"模型配置缺少必填字段 id：{d!r}")
+        rc = d.get("reasoning") or {}
+        reasoning = ReasoningConfig(
+            enabled=bool(d.get("supportsReasoning", False)),
+            effort=rc.get("effort"),
+            budget_tokens=rc.get("budgetTokens"),
+            extra_body=rc.get("extraBody") or {},
+        )
+        return cls(
+            model=d["id"],
+            name=d.get("name"),
+            vendor=d.get("vendor", "openai"),
+            api_key=d.get("apiKey"),
+            base_url=d.get("url"),
+            temperature=float(d.get("temperature", 0.0)),
+            max_tokens=int(d.get("maxOutputTokens", 2048)),
+            tool_calling=bool(d.get("supportsToolCall", True)),
+            vision=bool(d.get("supportsImages", False)),
+            reasoning=reasoning,
+            max_input_tokens=d.get("maxInputTokens"),
+            max_output_tokens=d.get("maxOutputTokens"),
+        )
+
+
+class ModelsFile(BaseModel):
+    """models.json 信封结构：default（默认模型 id）+ models[]。"""
+
+    default: Optional[str] = None
+    models: List[ModelConfig] = Field(default_factory=list)
+
+    def resolve_default(self) -> str:
+        """返回默认模型 id；default 指向不存在或缺失时取首项，否则报错。"""
+        if self.default and any(m.model == self.default for m in self.models):
+            return self.default
+        if self.models:
+            return self.models[0].model
+        raise ValueError("models.json 未配置任何模型")
 
 
 class TagCategoryConfig(BaseModel):
@@ -171,9 +235,12 @@ class MetricsConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    """端上配置文件（agent.yaml）对应的顶层结构。"""
+    """端上配置文件（agent.yaml）对应的顶层结构。
 
-    model: ModelConfig = Field(default_factory=ModelConfig)
+    模型配置已迁移至独立 models.json（UI 落盘，cagent 只读），
+    本结构不再包含 model 字段。
+    """
+
     # 提示词覆盖：key -> 模板字符串（支持 {step}/{tools} 等占位符）
     prompts: Dict[str, str] = Field(default_factory=dict)
     # 迭代次数控制
@@ -183,6 +250,10 @@ class AgentConfig(BaseModel):
     history_window: int = 10            # 注入后续步骤的最近 step 条目数；0 = 不限制
     observation_max_chars: int = 500    # 单条工具观察注入上下文时的截断长度；0 = 不截断
     history_summarize: bool = True      # 超窗条目是否用 LLM 滚动摘要（无 LLM 时退化为文本压缩）
+    # history token 预算裁剪：当 active 模型配置了 maxInputTokens 时，history 部分占用的
+    # 估算 token 不超过 max_input_tokens * 该比例（其余留给 system/goal/step/response）。
+    # 0 表示关闭 token 预算裁剪（仅按 history_window 计数裁剪）。
+    history_token_budget_ratio: float = 0.6
     # 读取语义阈值（针对 shell_exec 识别到的「读取类」命令，如 sed -n / head / grep -n）
     # 与 observation_max_chars 的区别：observation_max_chars 是兜底；read_* 是读取视图专用，
     # 行号化 + 头部契约 + 续读指令，按行（而非字符）截断，截断后模型仍能识别与续读。
