@@ -22,6 +22,7 @@ cagent/skills/refactor
 cagent/skills/test-gen
 config/agent.yaml
 .pids
+logs
 cagent/skills/tencent-docx
 cagent/skills/tencent-pptx
 cagent/skills/agent-browser
