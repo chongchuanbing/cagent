@@ -277,6 +277,66 @@ def test_shell_cd_space_with_relative_output_rejected(shell_env):
     assert r3.ok, r3.error
 
 
+def test_shell_relative_path_missing_in_scratch_but_in_project_hint(tmp_path):
+    """回归 7168fea8：会话作用域下 run_command 用裸相对路径 (docs/design/)
+    在 scratch 找不到，但项目根存在该路径时，错误 hint 应主动指出它在项目根存在，
+    并引导用 workspace:// 前缀或绝对路径，而非泛泛的「用 ls 确认路径」。
+
+    这复现了「docs/design/ 明明存在却报 No such file」的困惑：shell 默认 cwd
+    是会话 scratch（写安全），裸相对路径不会相对项目根解析。
+    """
+    from cagent.plugins.shell_exec import ShellExecutor
+    from cagent.runtime.session_scope import SessionScope, enter_scope
+    from cagent.runtime.paths import PathSpace
+
+    scratch = tmp_path / ".data" / "sessions" / "s1" / "scratch"
+    scratch.mkdir(parents=True)
+    proj = tmp_path / "myproj"
+    proj.mkdir()
+    # 项目根下确实存在 docs/design/（用户原始场景）
+    (proj / "docs" / "design").mkdir(parents=True)
+    (proj / "docs" / "design" / "arch.md").write_text("x", encoding="utf-8")
+
+    base_space = PathSpace.build_default(proj, data_dir=tmp_path / ".data")
+    session_space = base_space.for_session(scratch, space_root=proj)
+    ex = ShellExecutor({"work_dir": str(proj)}, path_space=base_space)
+    scope = SessionScope(scratch=scratch, space_root=proj, path_space=session_space)
+
+    with enter_scope(scope):
+        r = ex.execute("ls -la docs/design/")
+
+    assert not r.ok
+    assert r.error_kind == "EXEC_ERROR"
+    # 关键断言：hint 指出该路径在项目根存在，并给出 workspace:// / 绝对路径 的写法
+    assert str(proj / "docs" / "design") in r.hint
+    assert "workspace://" in r.hint
+    # 不应再出现误导性的「默认项目根」语义
+    assert "项目根" in r.hint
+
+
+def test_shell_workspace_scheme_reaches_project_in_scope(tmp_path):
+    """对照：会话作用域下用 workspace:// 前缀即可正确访问项目根（框架层面的正确写法）。"""
+    from cagent.plugins.shell_exec import ShellExecutor
+    from cagent.runtime.session_scope import SessionScope, enter_scope
+    from cagent.runtime.paths import PathSpace
+
+    scratch = tmp_path / ".data" / "sessions" / "s1" / "scratch"
+    scratch.mkdir(parents=True)
+    proj = tmp_path / "myproj"
+    proj.mkdir()
+    (proj / "docs" / "design").mkdir(parents=True)
+
+    base_space = PathSpace.build_default(proj, data_dir=tmp_path / ".data")
+    session_space = base_space.for_session(scratch, space_root=proj)
+    ex = ShellExecutor({"work_dir": str(proj)}, path_space=base_space)
+    scope = SessionScope(scratch=scratch, space_root=proj, path_space=session_space)
+
+    with enter_scope(scope):
+        r = ex.execute("ls -la workspace://docs/design/")
+    assert r.ok, r.error
+    assert "design" in r.content or r.content.strip() != ""
+
+
 # ── Agent.run 端到端 ───────────────────────────────────────
 
 

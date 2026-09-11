@@ -447,7 +447,7 @@ class ShellExecutor:
 
         # L6: 结构化错误回流
         if result.returncode != 0:
-            return self._classify_exit_code(result, command, rewrite_header)
+            return self._classify_exit_code(result, command, rewrite_header, effective_cwd)
 
         # 6. 输出处理（成功）：
         #    读取类命令 → 走行号化视图（行号 + 头部契约 + 续读指令），
@@ -512,11 +512,36 @@ class ShellExecutor:
 
         return None
 
+    def _resolve_if_exists_in_work_dir(
+        self, path: str, effective_cwd: Optional[str]
+    ) -> Optional[str]:
+        """若 path 是裸相对路径、在当前 effective_cwd（会话 scratch）找不到、
+        但在 self.work_dir（项目根）存在，返回其在项目根下的绝对路径，否则 None。
+
+        用途：会话作用域下 run_command 的 cwd 被钉在 scratch，模型用裸相对路径
+        （如 docs/design/）访问项目文件会失败。此函数用于在报错 hint 里指出
+        「该路径其实在项目根存在」，引导改用 workspace:// 前缀或绝对路径，
+        而不是泛泛地提示「用 ls 确认路径」。
+
+        仅对裸相对路径生效；绝对路径 / scheme:// 路径直接返回 None（交给其他分支）。
+        """
+        if not path or os.path.isabs(path) or "://" in path:
+            return None
+        ec = effective_cwd or self.work_dir
+        # 当前 cwd 就找得到 → 不是「在 scratch 找不到但在项目根有」的情形，不提示
+        if os.path.exists(os.path.realpath(os.path.join(ec, path))):
+            return None
+        cand = os.path.realpath(os.path.join(self.work_dir, path))
+        if os.path.exists(cand):
+            return cand
+        return None
+
     def _classify_exit_code(
         self,
         result: "subprocess.CompletedProcess",
         command: str,
         rewrite_header: str = "",
+        effective_cwd: Optional[str] = None,
     ) -> "ToolResult":
         """L6: 根据退出码分类错误并生成 hint。"""
         from ..tools.base import ToolResult
@@ -574,7 +599,7 @@ class ShellExecutor:
                     if len(parts) >= 2:
                         actual_path = parts[1].strip()
                         break
-            
+
             # hint 按实际错误特征分派：自然描述发生了什么，不做硬性流程指令
             if actual_path:
                 hint = f"路径不存在: {actual_path}"
@@ -582,9 +607,23 @@ class ShellExecutor:
                 if self.work_dir in actual_path:
                     relative_part = actual_path.replace(self.work_dir, '').lstrip('/')
                     hint += f"\n（路径被拼接为 {self.work_dir}/{relative_part}，可能是相对路径前缀有误）"
+                else:
+                    # 裸相对路径在会话 scratch 找不到、但在项目根存在：
+                    # 这是会话作用域下最常见的误用（cwd 被钉在 scratch 而非项目根），
+                    # 主动引导用 workspace:// 前缀或绝对路径访问项目根，避免模型反复试错。
+                    proj_path = self._resolve_if_exists_in_work_dir(actual_path, effective_cwd)
+                    if proj_path is not None:
+                        hint += (
+                            f"\n该路径在会话目录（{effective_cwd}）下不存在，"
+                            f"但在项目根下存在：{proj_path}\n"
+                            f"shell 默认工作目录是会话 scratch（写安全），裸相对路径不会相对项目根解析。"
+                            f"访问项目文件请用 workspace:// 前缀或绝对路径，例如："
+                            f"\n  ls workspace://{actual_path}"
+                            f"\n  ls {proj_path}"
+                        )
             else:
                 hint = "目标文件或目录不存在，请确认路径正确"
-            
+
             return ToolResult(
                 ok=False, content=content,
                 error="文件或目录不存在",

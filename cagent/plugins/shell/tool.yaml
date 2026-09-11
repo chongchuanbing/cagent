@@ -5,21 +5,29 @@ detail: "提供 shell 命令执行、代码搜索、Git 操作等"
 
 tree:
   - name: run_command
-    summary: "执行任意 shell 命令"
+    summary: "执行任意 shell 命令（默认工作目录 = 会话 scratch）"
     detail: |
       执行 shell 命令，返回 stdout/stderr/exit_code。
-      命令在工作目录下执行，受超时和黑名单限制。
+      命令在默认工作目录下执行，受超时和黑名单限制。
+
+      工作目录约定（重要）：
+      - 会话作用域下，默认 cwd 被钉在「会话 scratch 目录」（写安全：相对路径输出天然落会话目录），
+        不是项目根。裸相对路径（如 docs/design/）会相对 scratch 解析，找不到项目里的文件。
+      - 要访问项目根的文件/目录，请用 workspace:// 逻辑前缀（框架自动改写为项目根物理路径），
+        或直接使用绝对路径。这与 shell.sed/shell.rg 等模板工具的相对路径基准一致。
+      - 例：ls workspace://docs/design/  等价于  ls /abs/path/to/proj/docs/design/
 
       参数：
       - command（必填）：完整的 shell 命令
       - timeout（可选，默认 30）：超时秒数
-      - cwd（可选，默认工作目录）：工作目录
+      - cwd（可选，默认会话 scratch）：工作目录（传绝对路径可切到项目根；裸相对路径仍相对 scratch 解析）
 
       示例：
       run_command(path="shell.run_command", params={"command": "npm test", "timeout": 60})
 
       规则：
       - 命令在工作目录下执行，不能越界
+      - 裸相对路径默认相对「会话 scratch」解析；访问项目根请用 workspace:// 前缀或绝对路径
       - 黑名单命令会被拦截（如 rm -rf /、sudo）
       - stdout/stderr 自动截断
       - 【重要】禁止使用 cat 整读（无法指定行范围，会被静默截断）。
@@ -41,7 +49,7 @@ tree:
       cwd:
         type: string
         default: null
-        description: "工作目录（默认项目根）"
+        description: "工作目录（默认会话 scratch 目录；裸相对路径在此解析，访问项目根请用 workspace:// 或绝对路径）"
 
   - name: rg
     summary: "按正则搜索文件内容（ripgrep）"
