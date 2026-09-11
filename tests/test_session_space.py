@@ -19,24 +19,35 @@ def _base_space(tmp: Path) -> PathSpace:
 
 
 def test_for_session_without_space():
-    """无空间：workspace:// 即 scratch（别名），所有文件落会话目录。"""
+    """无空间：workspace:// = 项目根/当前目录，session:// = 会话 scratch（分离）。
+
+    设计：no-space 下 workspace:// 恒等于用户当前目录（项目根），裸相对路径相对
+    项目根解析；session:// 作为框架层临时/中间文件输出目录，与 workspace 物理分离。
+    """
     with tempfile.TemporaryDirectory() as d:
-        tmp = Path(d)
+        tmp = Path(os.path.realpath(d))
         base = _base_space(tmp)
         scratch = Path(os.path.realpath(tmp / ".data" / "sessions" / "s1" / "scratch"))
         space = base.for_session(scratch)
 
         ws = space.mounts["workspace"]
         sm = space.mounts["session"]
-        assert ws.physical == sm.physical == scratch
+        # workspace:// 仍指向项目根（当前目录），不再被重挂到 scratch
+        assert ws.physical == tmp
+        assert sm.physical == scratch
+        assert ws.physical != sm.physical
         assert sm.modes >= {"read", "write"}
-        # 裸相对路径解析到 scratch
-        assert space.resolve("out/a.txt") == scratch / "out" / "a.txt"
+        # default_mount=workspace → 裸相对路径解析到项目根
+        assert space.resolve("out/a.txt") == tmp / "out" / "a.txt"
+        # session:// 独立指向 scratch
         assert space.resolve("session://out/a.txt") == scratch / "out" / "a.txt"
+        # workspace:// 仍指向项目根
+        assert space.resolve("workspace://src/main.py") == tmp / "src" / "main.py"
 
 
 def test_for_session_with_space():
-    """空间模式：workspace:// 挂空间根，session:// 挂 scratch，两者分离。"""
+    """空间模式：workspace:// 挂空间根，session:// 挂 scratch，两者分离；
+    裸相对路径默认落 scratch（保护空间根）。"""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         base = _base_space(tmp)
@@ -59,14 +70,19 @@ def test_for_session_with_space():
         assert "临时" in card
 
 
-def test_path_card_merged_without_space():
+def test_path_card_no_space_distinct_workspace_and_session():
+    """无空间模式：path_card 区分 workspace（当前目录/项目根）与 session（框架临时输出）。"""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         base = _base_space(tmp)
         scratch = tmp / ".data" / "sessions" / "s1" / "scratch"
         space = base.for_session(scratch)
         card = space.path_card()
-        assert "所有生成文件默认写这里" in card
+        assert "session://" in card
+        assert "workspace://" in card
+        # workspace 不再是「会话工作目录」语义，而是当前目录/项目根
+        assert "当前工作目录" in card
+        assert "框架层临时" in card
 
 
 # ── filesystem.apply_patch + 会话作用域 ─────────────────────
@@ -277,13 +293,12 @@ def test_shell_cd_space_with_relative_output_rejected(shell_env):
     assert r3.ok, r3.error
 
 
-def test_shell_relative_path_missing_in_scratch_but_in_project_hint(tmp_path):
-    """回归 7168fea8：会话作用域下 run_command 用裸相对路径 (docs/design/)
-    在 scratch 找不到，但项目根存在该路径时，错误 hint 应主动指出它在项目根存在，
-    并引导用 workspace:// 前缀或绝对路径，而非泛泛的「用 ls 确认路径」。
+def test_shell_read_command_relative_path_falls_back_to_project_root(tmp_path):
+    """回归 03809787：用户给出的项目相对路径（docs/design/arch.md）应直接可用。
 
-    这复现了「docs/design/ 明明存在却报 No such file」的困惑：shell 默认 cwd
-    是会话 scratch（写安全），裸相对路径不会相对项目根解析。
+    会话作用域下 cwd 被钉在 scratch，裸相对路径本会在 scratch 下找不到。
+    对只读命令，框架应自动回退到项目根解析，让「用户给的真实路径」直接生效，
+    而不是要求模型手工转成 workspace:// 或绝对路径（否则模型会失败并转 ask_user）。
     """
     from cagent.plugins.shell_exec import ShellExecutor
     from cagent.runtime.session_scope import SessionScope, enter_scope
@@ -293,7 +308,66 @@ def test_shell_relative_path_missing_in_scratch_but_in_project_hint(tmp_path):
     scratch.mkdir(parents=True)
     proj = tmp_path / "myproj"
     proj.mkdir()
-    # 项目根下确实存在 docs/design/（用户原始场景）
+    (proj / "docs" / "design").mkdir(parents=True)
+    (proj / "docs" / "design" / "arch.md").write_text("hello\n", encoding="utf-8")
+
+    base_space = PathSpace.build_default(proj, data_dir=tmp_path / ".data")
+    session_space = base_space.for_session(scratch, space_root=proj)
+    ex = ShellExecutor({"work_dir": str(proj)}, path_space=base_space)
+    scope = SessionScope(scratch=scratch, space_root=proj, path_space=session_space)
+
+    # 读命令：裸相对路径自动回退到项目根
+    with enter_scope(scope):
+        r = ex.execute("ls -la docs/design/")
+    assert r.ok, r.error
+    assert "arch.md" in r.content
+
+    with enter_scope(scope):
+        r2 = ex.execute("sed -n '1,5p' docs/design/arch.md")
+    assert r2.ok, r2.error
+    assert "hello" in r2.content
+    # 改写痕迹对 trace 可见（透明可审计）：空间模式下回退到空间根
+    assert "空间根回退" in r2.content
+
+
+def test_shell_read_fallback_does_not_leak_writes(tmp_path):
+    """回退只作用于读命令：写命令的相对路径仍必须落 scratch，不能污染项目根。"""
+    from cagent.plugins.shell_exec import ShellExecutor
+    from cagent.runtime.session_scope import SessionScope, enter_scope
+    from cagent.runtime.paths import PathSpace
+
+    scratch = tmp_path / ".data" / "sessions" / "s1" / "scratch"
+    scratch.mkdir(parents=True)
+    proj = tmp_path / "myproj"
+    proj.mkdir()
+    (proj / "docs").mkdir()
+
+    base_space = PathSpace.build_default(proj, data_dir=tmp_path / ".data")
+    session_space = base_space.for_session(scratch, space_root=proj)
+    ex = ShellExecutor({"work_dir": str(proj)}, path_space=base_space)
+    scope = SessionScope(scratch=scratch, space_root=proj, path_space=session_space)
+
+    with enter_scope(scope):
+        r = ex.execute("echo hi > out.txt")
+    assert r.ok, r.error
+    assert (scratch / "out.txt").read_text().strip() == "hi"
+    # 项目根未被污染
+    assert not (proj / "out.txt").exists()
+
+
+def test_shell_non_read_command_still_hints_project_root(tmp_path):
+    """非只读命令（如 cp）不在回退范围内，失败时仍应给出「项目根存在」的 hint。
+
+    保证回退收窄到只读命令后，其余场景的错误反馈没有退化。
+    """
+    from cagent.plugins.shell_exec import ShellExecutor
+    from cagent.runtime.session_scope import SessionScope, enter_scope
+    from cagent.runtime.paths import PathSpace
+
+    scratch = tmp_path / ".data" / "sessions" / "s1" / "scratch"
+    scratch.mkdir(parents=True)
+    proj = tmp_path / "myproj"
+    proj.mkdir()
     (proj / "docs" / "design").mkdir(parents=True)
     (proj / "docs" / "design" / "arch.md").write_text("x", encoding="utf-8")
 
@@ -303,15 +377,13 @@ def test_shell_relative_path_missing_in_scratch_but_in_project_hint(tmp_path):
     scope = SessionScope(scratch=scratch, space_root=proj, path_space=session_space)
 
     with enter_scope(scope):
-        r = ex.execute("ls -la docs/design/")
+        r = ex.execute("cp docs/design/arch.md ./copy.md")
 
     assert not r.ok
     assert r.error_kind == "EXEC_ERROR"
-    # 关键断言：hint 指出该路径在项目根存在，并给出 workspace:// / 绝对路径 的写法
-    assert str(proj / "docs" / "design") in r.hint
+    # hint 仍指出该路径在项目根存在，并给出 workspace:// / 绝对路径 写法
+    assert str(proj / "docs" / "design" / "arch.md") in r.hint
     assert "workspace://" in r.hint
-    # 不应再出现误导性的「默认项目根」语义
-    assert "项目根" in r.hint
 
 
 def test_shell_workspace_scheme_reaches_project_in_scope(tmp_path):
@@ -335,6 +407,44 @@ def test_shell_workspace_scheme_reaches_project_in_scope(tmp_path):
         r = ex.execute("ls -la workspace://docs/design/")
     assert r.ok, r.error
     assert "design" in r.content or r.content.strip() != ""
+
+
+def test_shell_nospace_bare_relative_reads_project_root(tmp_path):
+    """回归 03809787（no-space）：用户给出的裸相对路径（docs/design/）应直接可读。
+
+    无空间模式下 workspace:// = 项目根/当前目录，shell 默认 cwd = 项目根，
+    因此裸相对路径相对项目根解析，无需 workspace:// 前缀或绝对路径。
+    这是用户决策的核心：no-space 下 workspace:// 就是当前目录。
+    """
+    from cagent.plugins.shell_exec import ShellExecutor
+    from cagent.runtime.session_scope import SessionScope, enter_scope
+    from cagent.runtime.paths import PathSpace
+
+    scratch = tmp_path / ".data" / "sessions" / "s1" / "scratch"
+    scratch.mkdir(parents=True)
+    proj = tmp_path / "myproj"
+    proj.mkdir()
+    (proj / "docs" / "design").mkdir(parents=True)
+    (proj / "docs" / "design" / "arch.md").write_text("hello\n", encoding="utf-8")
+
+    base_space = PathSpace.build_default(proj, data_dir=tmp_path / ".data")
+    # 无空间会话：space_root=None
+    session_space = base_space.for_session(scratch, space_root=None)
+    ex = ShellExecutor({"work_dir": str(proj)}, path_space=base_space)
+    scope = SessionScope(scratch=scratch, space_root=None, path_space=session_space)
+
+    # 关键断言：裸相对路径直接生效（cwd=项目根），不发生回退改写
+    with enter_scope(scope):
+        r = ex.execute("ls -la docs/design/")
+    assert r.ok, r.error
+    assert "arch.md" in r.content
+    # 无空间模式下 cwd 即项目根，读取类命令不应触发「项目根/空间根回退」改写
+    assert "回退" not in r.content
+
+    with enter_scope(scope):
+        r2 = ex.execute("sed -n '1,5p' docs/design/arch.md")
+    assert r2.ok, r2.error
+    assert "hello" in r2.content
 
 
 # ── Agent.run 端到端 ───────────────────────────────────────

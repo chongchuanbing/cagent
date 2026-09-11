@@ -1,11 +1,14 @@
 """会话路径作用域：run 期间让文件/Shell 工具感知「会话 scratch + 空间根」。
 
-核心规则（会话路径隔离）：
-- 临时/中间文件 → 会话 scratch（.data/sessions/<sid>/scratch）
-- 无空间模式：workspace:// 即 scratch（模型无感知，所有生成文件落会话目录）
-- 空间模式：workspace:// = 空间根（如项目代码目录）；
-  - 结构化工具（filesystem.apply_patch 等）可显式写空间，写入自动登记审计；
-  - shell 的 cwd 钉在 scratch，重定向等绝对路径写空间被拦截。
+核心规则（会话路径隔离，详见 runtime/paths.py PathSpace.for_session）：
+- session:// 始终 = 会话 scratch（.data/sessions/<sid>/scratch），作为框架层临时/
+  中间文件输出目录。
+- 无空间模式（space_root=None）：workspace:// = 项目根 / 当前目录，shell 默认
+  cwd = 项目根，裸相对路径相对项目根解析，与用户「当前目录」心智一致。
+- 空间模式（space_root 指定）：workspace:// = 空间根（如项目代码目录），
+  session:// = 会话 scratch；shell 默认 cwd = scratch（保护空间根，避免相对写
+  污染项目），裸相对写天然落会话目录；结构化工具（filesystem.apply_patch 等）
+  可显式写空间根，写入自动登记审计。
 
 实现方式：ContextVar 携带当前会话作用域，Agent.run() 进入时设置、
 结束时恢复。工具执行发生在 run 调用链内，天然可见；无作用域时
@@ -23,8 +26,8 @@ import contextvars
 class SessionScope:
     """一次 run 的路径作用域。
 
-    - scratch: 会话工作目录（唯一默认可写区）
-    - space_root: 空间根目录（None = 无空间模式）
+    - scratch: 会话临时/中间文件目录（框架层输出目录，session:// 物理根）
+    - space_root: 空间根目录（None = 无空间模式；非 None = 空间模式）
     - path_space: 会话级派生 PathSpace（session:// + workspace:// 已按规则挂载）
     - record_write: 空间写入审计回调 (rel_path, op)，由 Agent.run 注入
     """

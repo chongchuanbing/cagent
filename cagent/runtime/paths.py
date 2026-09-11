@@ -159,12 +159,13 @@ class PathSpace:
     ) -> "PathSpace":
         """按会话派生新实例（会话路径隔离，详见 runtime/session_scope.py）。
 
-        - 始终注册 session:// → scratch（会话工作目录，临时/中间文件落此处）
-        - space_root=None（无空间）：workspace:// 重挂为 scratch（别名，模型无感知，
-          所有生成文件天然落会话目录）
-        - space_root 指定（空间模式）：workspace:// 挂空间根——结构化工具可显式
-          写入（登记审计），shell 写入由 ShellExecutor 拦截
-        - workspace 原有的 expose_to_llm / modes 语义保留，仅替换物理根
+        - 始终注册 session:// → scratch（会话工作目录，框架层临时/中间产物输出目录）
+        - workspace:// 语义与用户心智一致：
+          - space_root=None（无空间）：workspace:// 保持为「项目根 / 当前工作目录」，
+            不再重挂到 scratch；裸相对路径默认相对项目根解析。
+          - space_root 指定（空间模式）：workspace:// 挂空间根（如项目代码目录），
+            裸相对路径解析基准切到 session://（临时文件落会话目录，保护空间根）。
+        - workspace 原有的 expose_to_llm / modes 语义保留，仅替换物理根。
         """
         scratch_p = Path(os.path.realpath(str(scratch)))
         ws = self.mounts.get("workspace")
@@ -176,8 +177,9 @@ class PathSpace:
             sandbox=ws.sandbox if ws else True,
             modes=ws.modes if ws else frozenset({"read", "write", "exec"}),
         )
+        # 无空间模式：workspace:// 保持项目根（当前工作目录），不重定向到 scratch
         if space_root is None:
-            new_ws_physical = scratch_p
+            new_ws_physical = ws.physical if ws is not None else scratch_p
         else:
             new_ws_physical = Path(os.path.realpath(str(space_root)))
         if ws is not None:
@@ -186,8 +188,8 @@ class PathSpace:
             )
         else:
             mounts["workspace"] = Mount("workspace", new_ws_physical)
-        # 空间模式：裸相对路径的解析基准改为 session://（临时文件落会话目录）；
-        # 无空间模式：workspace 即 scratch，基准保持 workspace 不变
+        # 裸相对路径解析基准：空间模式 → session://（保护空间根）；
+        # 无空间模式 → workspace://（即项目根 / 当前工作目录）
         return PathSpace(
             self.base_dir, mounts, self.allow_paths, self.allow_symlink_targets,
             default_mount="session" if space_root is not None else "workspace",
@@ -360,18 +362,24 @@ class PathSpace:
         skills:// 为框架级约定（技能资源经 read_skill_file 读取），无论是否已显式
         挂载都在此说明；其余 scheme 仅列 expose_to_llm 的挂载点。
 
-        会话隔离语义：session:// 与 workspace:// 物理根不同（空间模式）时分别
-        说明用途；相同（无空间模式）时合并为一条，模型无感知差异。
+        会话隔离语义（按 default_mount 区分模式）：
+        - default_mount="workspace"（无空间模式）：workspace:// = 当前目录/项目根，
+          可直接读写、shell 默认在此执行；session:// = 框架层临时/中间文件输出目录，
+          模型勿手动写入。
+        - default_mount="session"（空间模式）：workspace:// = 受保护空间根（只读浏览，
+          改动走文件工具登记审计）；session:// = 用户会话工作目录（临时文件写这里）。
         """
         ws = self.mounts.get("workspace")
         sm = self.mounts.get("session")
-        if (
+        space_mode = (
             ws is not None
             and sm is not None
             and ws.expose_to_llm
             and sm.expose_to_llm
             and ws.physical != sm.physical
-        ):
+            and self.default_mount == "session"
+        )
+        if space_mode:
             meaning = {
                 "session": (
                     "本次会话工作目录，临时/中间文件一律写这里"
@@ -380,6 +388,27 @@ class PathSpace:
                 "workspace": (
                     "项目空间（只读浏览）；修改项目文件必须用 workspace:// 前缀"
                     "走文件工具（写入会登记审计），shell 命令中勿写此目录"
+                ),
+                "data": "框架私有数据存储（默认对模型隐藏，勿直接读写）",
+                "self": "框架自身代码（只读，勿改）",
+                "plugins": "插件目录（只读）",
+                "config": "配置目录（只读）",
+            }
+        elif (
+            ws is not None
+            and sm is not None
+            and ws.expose_to_llm
+            and sm.expose_to_llm
+            and ws.physical != sm.physical
+        ):
+            # 无空间模式：workspace=当前目录（项目根，可写）；session=框架临时输出
+            meaning = {
+                "workspace": (
+                    "当前工作目录（项目根），可直接读写；shell 命令默认在此执行，"
+                    "裸相对路径相对此处解析"
+                ),
+                "session": (
+                    "框架层临时/中间文件输出目录（仅框架内部写入，勿手动引用）"
                 ),
                 "data": "框架私有数据存储（默认对模型隐藏，勿直接读写）",
                 "self": "框架自身代码（只读，勿改）",

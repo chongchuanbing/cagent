@@ -15,7 +15,7 @@
 shell 工具当前的安全模型是**应用层软沙箱**（`ShellExecutor` 的 7 层校验链）：
 
 1. 黑名单子串匹配（`blocked_patterns`，默认空）
-2. cwd 白名单（钉在会话 scratch 或空间根）
+2. cwd 白名单（跟随会话空间 default_mount：无空间模式=项目根/当前目录，空间模式=会话 scratch；显式 cwd 仍允许落空间根）
 3. 重定向目标检查（`_redirect_violation`）
 4. `cd` 漂移拦截
 5. 命令体绝对路径扫描（`PathSpace.command_path_violations`）

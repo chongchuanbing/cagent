@@ -37,6 +37,24 @@ _READ_GREP_COMMANDS = frozenset({"grep", "egrep", "fgrep", "rg", "ripgrep", "bat
 # 整读禁止命令（无法指定行范围 → 必然被截断 → 静默失败风险）
 _BLOCKED_COMMANDS = frozenset({"cat"})
 
+# 只读命令：不创建/修改/删除任何文件。
+# 用于「项目根回退」的安全边界——只有这类命令的裸相对路径才允许自动回退到项目根解析；
+# 写命令一律不参与（相对写必须落会话 scratch，保持会话写隔离）。
+_READ_ONLY_COMMANDS = (
+    _READ_VIEW_COMMANDS
+    | _READ_GREP_COMMANDS
+    | frozenset({
+        "ls", "find", "fd", "wc", "stat", "tree", "file", "du",
+        "diff", "less", "more", "readlink", "dirname", "basename",
+    })
+)
+
+# find 的这些子选项会写/删文件，出现时禁止项目根回退（否则会改动项目文件）
+_FIND_MUTATING_OPTS = (
+    "-delete", "-exec", "-execdir", "-ok", "-okdir",
+    "-fls", "-fprint", "-fprint0", "-fprintf",
+)
+
 # sed 行范围提取：sed -n 'A,Bp' | sed -n 'A,B'p | sed -n "A,$p"
 _SED_RANGE_RE = re.compile(
     r"""-n\s+['"]?(\d+)\s*,\s*(\d+|\$)p?['"]?"""
@@ -325,21 +343,34 @@ class ShellExecutor:
         # 2. 超时限制
         effective_timeout = min(timeout or self.default_timeout, self.max_timeout)
 
-        # 会话作用域：cwd 默认钉在会话 scratch（相对路径输出天然落会话目录）；
-        # 显式 cwd 允许 scratch 或空间根（构建/测试需 cd 到项目目录）
+        # 会话作用域：cwd 跟随会话空间 default_mount 语义（PathSpace 单一事实源）：
+        #   - 无空间模式（space_root=None）：default_mount="workspace"，workspace://=项目根
+        #     → cwd 默认项目根，裸相对路径相对项目根解析（与用户心智「当前目录」一致）。
+        #   - 空间模式（space_root 指定）：default_mount="session"，workspace://=空间根、
+        #     session://=会话 scratch → cwd 默认 scratch，裸相对写天然落会话目录，保护空间根。
+        # 显式 cwd 仍允许落 scratch 或空间根（构建/测试需 cd 到项目目录）。
         from ..runtime.session_scope import current_scope
 
         scope = current_scope()
         work_dir = self.work_dir
+        cwd_base = self.work_dir
+        proj_root = self.work_dir  # 只读回退 / 错误 hint 用的「项目根 / 空间根」
         allowed_cwd_roots = [self.work_dir]
         if scope is not None:
-            work_dir = str(scope.scratch)
-            allowed_cwd_roots = [str(scope.scratch)]
+            sp = scope.path_space
+            if sp is not None:
+                cwd_base = str(sp.mounts[sp.default_mount].physical)
+                ws = sp.mounts.get("workspace")
+                if ws is not None:
+                    proj_root = str(ws.physical)
+            else:
+                cwd_base = str(scope.scratch)
+            allowed_cwd_roots = [cwd_base]
             if scope.space_root is not None:
                 allowed_cwd_roots.append(str(scope.space_root))
 
         # 3. 工作目录限制
-        effective_cwd = os.path.realpath(cwd or work_dir)
+        effective_cwd = os.path.realpath(cwd or cwd_base)
         if not any(
             effective_cwd == r or effective_cwd.startswith(r + os.sep)
             for r in allowed_cwd_roots
@@ -352,10 +383,25 @@ class ShellExecutor:
                 hint=f"工作目录 {cwd} 超出允许范围，请在 {roots_desc} 内操作",
             )
 
-        # 会话作用域下的重定向写拦截：绝对路径重定向目标必须落在 scratch 内，
-        # 写项目空间（workspace://）必须走文件工具（显式 scheme + 审计）
+        # 3.5 项目根回退：会话作用域下，只读命令里用户/模型给出的项目相对路径
+        #     （docs/xxx.md）若在当前 cwd 下找不到、但在 proj_root（项目根/空间根）存在，
+        #     则自动改写为 proj_root 绝对路径，让「用户给的真实路径」直接可用。
+        #     写命令不参与 —— 相对写落 cwd 基准，会话写隔离不变。
+        #     无空间模式 cwd 即项目根，此分支通常不触发；空间模式下 cwd=scratch、
+        #     proj_root=空间根，此分支把裸相对路径正确指向空间根。
+        if self._is_read_only_command(command):
+            command, fallback_rewrites = self._apply_project_root_fallback(
+                command, effective_cwd, proj_root
+            )
+            if fallback_rewrites:
+                scheme_rewrites = scheme_rewrites + fallback_rewrites
+                rewrite_header = self._format_rewrite_header(scheme_rewrites)
+
+        # 会话作用域下的重定向写拦截：绝对路径重定向目标必须落在 cwd 基准内。
+        #   - 无空间模式：cwd 基准=项目根 → 重定向到项目内任意位置放行
+        #   - 空间模式：cwd 基准=会话 scratch → 重定向到 scratch 放行，写空间根拦截
         if scope is not None:
-            bad_redirect = _redirect_violation(command, str(scope.scratch))
+            bad_redirect = _redirect_violation(command, cwd_base)
             if bad_redirect is not None:
                 ws = self.path_space.mounts.get("workspace") if self.path_space else None
                 ws_root = ws.physical if ws is not None else None
@@ -370,7 +416,7 @@ class ShellExecutor:
                         "临时文件请用相对路径（落会话目录）"
                     )
                 else:
-                    hint = f"重定向目标 {bad_redirect} 超出会话目录，请写相对路径"
+                    hint = f"重定向目标 {bad_redirect} 超出允许目录（{cwd_base}），请写相对路径"
                 return ToolResult(
                     ok=False, content="",
                     error=f"重定向目标越界: {bad_redirect}",
@@ -393,13 +439,17 @@ class ShellExecutor:
                     ),
                 )
 
-        # L4: 命令体绝对路径沙箱检查（优先走 PathSpace；未注入则回退内置实现）
+        # L4: 命令体绝对路径沙箱检查（优先走 PathSpace；未注入则回退内置实现）。
+        # 优先用会话派生 path_space（空间模式下 workspace://=空间根），保证校验基准一致。
         if self.enable_path_sandbox:
-            if self.path_space is not None:
-                violations = self.path_space.command_path_violations(command)
+            check_space = self.path_space
+            if scope is not None and scope.path_space is not None:
+                check_space = scope.path_space
+            if check_space is not None:
+                violations = check_space.command_path_violations(command)
                 if violations:
                     bad = violations[0]
-                    ws = self.path_space.mounts.get("workspace")
+                    ws = check_space.mounts.get("workspace")
                     ws_root = ws.physical if ws else self.work_dir
                     return ToolResult(
                         ok=False, content="",
@@ -447,7 +497,7 @@ class ShellExecutor:
 
         # L6: 结构化错误回流
         if result.returncode != 0:
-            return self._classify_exit_code(result, command, rewrite_header, effective_cwd)
+            return self._classify_exit_code(result, command, rewrite_header, effective_cwd, proj_root)
 
         # 6. 输出处理（成功）：
         #    读取类命令 → 走行号化视图（行号 + 头部契约 + 续读指令），
@@ -513,14 +563,14 @@ class ShellExecutor:
         return None
 
     def _resolve_if_exists_in_work_dir(
-        self, path: str, effective_cwd: Optional[str]
+        self, path: str, effective_cwd: Optional[str], project_root: Optional[str] = None
     ) -> Optional[str]:
-        """若 path 是裸相对路径、在当前 effective_cwd（会话 scratch）找不到、
-        但在 self.work_dir（项目根）存在，返回其在项目根下的绝对路径，否则 None。
+        """若 path 是裸相对路径、在当前 effective_cwd 找不到、但在 project_root
+        （无空间=项目根；空间模式=空间根）存在，返回其绝对路径，否则 None。
 
-        用途：会话作用域下 run_command 的 cwd 被钉在 scratch，模型用裸相对路径
-        （如 docs/design/）访问项目文件会失败。此函数用于在报错 hint 里指出
-        「该路径其实在项目根存在」，引导改用 workspace:// 前缀或绝对路径，
+        用途：会话作用域下 run_command 的 cwd 与项目/空间根不同（空间模式 cwd=scratch），
+        模型用裸相对路径（如 docs/design/）访问项目文件会失败。此函数用于在报错 hint
+        里指出「该路径其实在项目根存在」，引导改用 workspace:// 前缀或绝对路径，
         而不是泛泛地提示「用 ls 确认路径」。
 
         仅对裸相对路径生效；绝对路径 / scheme:// 路径直接返回 None（交给其他分支）。
@@ -528,10 +578,10 @@ class ShellExecutor:
         if not path or os.path.isabs(path) or "://" in path:
             return None
         ec = effective_cwd or self.work_dir
-        # 当前 cwd 就找得到 → 不是「在 scratch 找不到但在项目根有」的情形，不提示
+        # 当前 cwd 就找得到 → 不是「在 cwd 找不到但在项目根有」的情形，不提示
         if os.path.exists(os.path.realpath(os.path.join(ec, path))):
             return None
-        cand = os.path.realpath(os.path.join(self.work_dir, path))
+        cand = os.path.realpath(os.path.join(project_root or self.work_dir, path))
         if os.path.exists(cand):
             return cand
         return None
@@ -542,6 +592,7 @@ class ShellExecutor:
         command: str,
         rewrite_header: str = "",
         effective_cwd: Optional[str] = None,
+        project_root: Optional[str] = None,
     ) -> "ToolResult":
         """L6: 根据退出码分类错误并生成 hint。"""
         from ..tools.base import ToolResult
@@ -608,15 +659,17 @@ class ShellExecutor:
                     relative_part = actual_path.replace(self.work_dir, '').lstrip('/')
                     hint += f"\n（路径被拼接为 {self.work_dir}/{relative_part}，可能是相对路径前缀有误）"
                 else:
-                    # 裸相对路径在会话 scratch 找不到、但在项目根存在：
-                    # 这是会话作用域下最常见的误用（cwd 被钉在 scratch 而非项目根），
-                    # 主动引导用 workspace:// 前缀或绝对路径访问项目根，避免模型反复试错。
-                    proj_path = self._resolve_if_exists_in_work_dir(actual_path, effective_cwd)
+                    # 裸相对路径在当前 cwd（空间模式=会话 scratch）找不到、但在项目根/空间根存在：
+                    # 主动引导用 workspace:// 前缀或绝对路径访问，避免模型反复试错。
+                    proj_path = self._resolve_if_exists_in_work_dir(
+                        actual_path, effective_cwd, project_root
+                    )
                     if proj_path is not None:
                         hint += (
-                            f"\n该路径在会话目录（{effective_cwd}）下不存在，"
-                            f"但在项目根下存在：{proj_path}\n"
-                            f"shell 默认工作目录是会话 scratch（写安全），裸相对路径不会相对项目根解析。"
+                            f"\n该路径在工作目录（{effective_cwd}）下不存在，"
+                            f"但在项目根/空间根下存在：{proj_path}\n"
+                            f"无空间模式下 shell 默认工作目录即项目根；若处于空间模式，"
+                            f"裸相对路径相对会话 scratch 解析。"
                             f"访问项目文件请用 workspace:// 前缀或绝对路径，例如："
                             f"\n  ls workspace://{actual_path}"
                             f"\n  ls {proj_path}"
@@ -804,6 +857,53 @@ class ShellExecutor:
             return False
         cmd = _extract_command_name(command)
         return cmd in _BLOCKED_COMMANDS
+
+    def _is_read_only_command(self, command: str) -> bool:
+        """是否为「只读命令」（不创建/修改/删除任何文件）。
+
+        这是「项目根回退」的安全闸门：只有只读命令的裸相对路径才允许自动回退到
+        项目根解析。含写语义子选项的 find（-delete/-exec/...）不算只读。
+        """
+        cmd = _extract_command_name(command)
+        if cmd is None or cmd not in _READ_ONLY_COMMANDS:
+            return False
+        if cmd == "find" and any(o in command for o in _FIND_MUTATING_OPTS):
+            return False
+        return True
+
+    def _apply_project_root_fallback(
+        self, command: str, effective_cwd: str, project_root: Optional[str] = None
+    ) -> "tuple[str, List[str]]":
+        """只读命令中「裸相对路径」的项目根/空间根回退改写。
+
+        问题背景：会话作用域下，用户/模型给出的项目相对路径（如 docs/xxx.md）若在当前
+        cwd 下找不到、但在 proj_root（无空间模式=项目根；空间模式=空间根）存在，则自动
+        改写为 proj_root 绝对路径，让「用户给了真实路径，框架却处理不了」的失败消失。
+
+        策略（只对只读命令生效）：
+        - cwd 下已存在 → 不动（cwd 优先，保证临时文件语义）
+        - cwd 下不存在、但 proj_root 下存在 → 改写为 proj_root 绝对路径
+        - 两边都不存在 → 不动（留给原错误分流，由 _classify_exit_code 出 hint）
+
+        只改写 _extract_target_file 提取出的目标 token，不碰 pattern / flag 值。
+        返回 (改写后命令, 改写清单)；清单会附到输出头部，保持透明可审计。
+        """
+        root = project_root or self.work_dir
+        target = self._extract_target_file(command)
+        if not target or os.path.isabs(target) or "://" in target:
+            return command, []
+        cwd_cand = os.path.realpath(os.path.join(effective_cwd, target))
+        if os.path.exists(cwd_cand):
+            return command, []  # cwd 优先
+        proj_cand = os.path.realpath(os.path.join(root, target))
+        if not os.path.exists(proj_cand):
+            return command, []  # 两边都没有，交给原错误分流
+        # 精确替换目标 token（可能带引号），避免误伤 pattern
+        for candidate in (target, f'"{target}"', f"'{target}'"):
+            if candidate in command:
+                new_command = command.replace(candidate, proj_cand, 1)
+                return new_command, [f"{target} → {proj_cand}（项目根/空间根回退）"]
+        return command, []
 
     def _extract_target_file(self, command: str) -> Optional[str]:
         """从命令字符串粗略提取目标文件路径。
