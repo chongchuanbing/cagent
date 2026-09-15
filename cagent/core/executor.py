@@ -38,10 +38,20 @@ class Executor:
         """
         logger.info(f"execute_step: 开始执行 step {step.id}，描述: {step.description[:50]}")
         step.status = StepStatus.RUNNING
-        result = self.react_engine.run(step, history=history, goal=goal)
-        step.status = StepStatus.DONE if result.success else StepStatus.FAILED
-        logger.info(f"execute_step: step {step.id} 执行完成，状态: {step.status.value}")
-        return result
+        try:
+            result = self.react_engine.run(step, history=history, goal=goal)
+            step.status = StepStatus.DONE if result.success else StepStatus.FAILED
+            logger.info(f"execute_step: step {step.id} 执行完成，状态: {step.status.value}")
+            return result
+        except Exception as e:
+            logger.error(f"execute_step: step {step.id} 执行异常: {type(e).__name__}: {e}", exc_info=True)
+            step.status = StepStatus.FAILED
+            return StepResult(
+                step_id=step.id,
+                success=False,
+                output=f"步骤执行异常: {type(e).__name__}: {e}",
+                error=f"{type(e).__name__}: {e}",
+            )
 
     def update(self, plan: Plan, step_result: StepResult) -> None:
         """将结果回写到对应 step（状态由 execute_step 单点管理）。"""

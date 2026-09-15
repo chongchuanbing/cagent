@@ -1,5 +1,7 @@
 """ReAct 引擎：单 step 内的 Thought → Action → Observation 循环。"""
 import json
+import time
+import inspect
 from typing import List, Optional
 
 from ..llm.base import LLMClient
@@ -184,7 +186,24 @@ class ReActEngine:
         ]
 
         for _ in range(self.max_iterations):
-            resp = self.llm.complete_with_tools(messages, tool_schemas)
+            # LLM 调用:带 try-except 和指数退避重试,防止 API 异常直接穿透
+            resp = None
+            for attempt in range(3):
+                try:
+                    resp = self.llm.complete_with_tools(messages, tool_schemas)
+                    break
+                except Exception as e:
+                    logger.warning(f"LLM 调用失败 (attempt {attempt + 1}/3): {type(e).__name__}: {e}")
+                    if attempt < 2:
+                        time.sleep(min(2 ** attempt, 10))
+                    else:
+                        logger.error(f"LLM 调用连续 3 次失败,step {step.id} 终止")
+                        return StepResult(
+                            step_id=step.id,
+                            success=False,
+                            output="",
+                            error=f"LLM 调用持续失败: {type(e).__name__}: {e}",
+                        )
 
             if resp.content:
                 self.last_trace.append({"thought": resp.content})
@@ -231,11 +250,25 @@ class ReActEngine:
                 )
             )
 
-            for tc in resp.tool_calls:
-                name = tc["function"]["name"]
+            for tc in (resp.tool_calls or []):
+                # 防御性检查：tool_calls 结构可能不完整（不同 LLM 提供商格式差异）
                 try:
-                    args = json.loads(tc["function"]["arguments"] or "{}")
-                except json.JSONDecodeError:
+                    name = tc["function"]["name"]
+                except (KeyError, TypeError) as e:
+                    logger.warning(f"tool_calls 结构异常，缺少 function.name: {tc}, 错误: {e}")
+                    messages.append(
+                        Message(
+                            role=MessageRole.TOOL,
+                            content=f"[错误] tool_calls 格式异常，无法解析工具名称: {tc}。请确保 tool_calls 包含 function.name 字段。",
+                            tool_call_id=tc.get("id") if isinstance(tc, dict) else None,
+                        )
+                    )
+                    continue
+                try:
+                    raw_args = tc["function"].get("arguments") or "{}"
+                    args = json.loads(raw_args)
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    logger.warning(f"tool_calls arguments 解析失败: {tc}, 错误: {e}")
                     args = {}
 
                 # Doom loop 检测：检查是否陷入重复调用模式
@@ -267,7 +300,7 @@ class ReActEngine:
                         Message(
                             role=MessageRole.TOOL,
                             content=obs_content,
-                            tool_call_id=tc.get("id"),
+                            tool_call_id=tc.get("id") if isinstance(tc, dict) else None,
                         )
                     )
                     continue
@@ -284,7 +317,7 @@ class ReActEngine:
                         Message(
                             role=MessageRole.TOOL,
                             content=obs_content,
-                            tool_call_id=tc.get("id"),
+                            tool_call_id=tc.get("id") if isinstance(tc, dict) else None,
                         )
                     )
                     # 触发收敛，提前结束：熔断说明当前策略已不可行，
@@ -304,22 +337,49 @@ class ReActEngine:
                     ok = False
                     error_kind = "TOOL_UNAVAILABLE"
                 else:
-                    result = tool.run(**args)
-                    ok = result.ok
-                    error_kind = getattr(result, "error_kind", None)
-                    if not ok:
-                        # 失败详情回传：content（附加上下文）+ error（原因）+ hint（可执行建议）。
-                        # 若只回传空 content，模型看不到真实失败原因，只能盲目换猜测重试。
-                        parts = []
-                        if result.content:
-                            parts.append(result.content)
-                        if getattr(result, "error", None):
-                            parts.append(f"错误：{result.error}")
-                        if getattr(result, "hint", None):
-                            parts.append(f"建议：{result.hint}")
-                        obs_content = "\n".join(parts) or "（工具执行失败，未返回错误信息）"
-                    else:
-                        obs_content = result.content
+                    try:
+                        # 参数过滤：检查工具是否接受 **kwargs
+                        # 如果接受 **kwargs，则传递所有参数；否则只传递显式声明的参数
+                        sig = inspect.signature(tool.run)
+                        has_var_keyword = any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in sig.parameters.values()
+                        )
+                        
+                        if has_var_keyword:
+                            # run() 接受 **kwargs，传递所有参数
+                            result = tool.run(**args)
+                        else:
+                            # run() 有显式参数，只传递声明的参数
+                            valid_params = {n for n in sig.parameters.keys() if n != 'self'}
+                            filtered_args = {k: v for k, v in args.items() if k in valid_params}
+                            filtered_out = set(args.keys()) - set(filtered_args.keys())
+                            if filtered_out:
+                                logger.warning(
+                                    f"工具 {name} 参数过滤：移除了不被接受的参数 {filtered_out}。"
+                                    f"有效参数: {valid_params}，传入参数: {set(args.keys())}"
+                                )
+                            result = tool.run(**filtered_args)
+                        ok = result.ok
+                        error_kind = getattr(result, "error_kind", None)
+                        if not ok:
+                            # 失败详情回传：content（附加上下文）+ error（原因）+ hint（可执行建议）。
+                            # 若只回传空 content，模型看不到真实失败原因，只能盲目换猜测重试。
+                            parts = []
+                            if result.content:
+                                parts.append(result.content)
+                            if getattr(result, "error", None):
+                                parts.append(f"错误：{result.error}")
+                            if getattr(result, "hint", None):
+                                parts.append(f"建议：{result.hint}")
+                            obs_content = "\n".join(parts) or "（工具执行失败，未返回错误信息）"
+                        else:
+                            obs_content = result.content
+                    except Exception as e:
+                        logger.warning(f"工具 {name} 执行异常: {type(e).__name__}: {e}")
+                        ok = False
+                        error_kind = "TOOL_EXCEPTION"
+                        obs_content = f"[工具执行异常] {type(e).__name__}: {e}"
 
                 # L5: 记录失败（按 args 细粒度计数）
                 if not ok and self._failure_ledger:
@@ -347,7 +407,7 @@ class ReActEngine:
                     Message(
                         role=MessageRole.TOOL,
                         content=obs_content,
-                        tool_call_id=tc.get("id"),
+                        tool_call_id=tc.get("id") if isinstance(tc, dict) else None,
                     )
                 )
 

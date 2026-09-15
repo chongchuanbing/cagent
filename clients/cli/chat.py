@@ -68,7 +68,8 @@ def cmd_chat(args) -> int:
             if not goal:
                 # EOF
                 break
-            goal = goal.strip()
+            # 输入边界：stdin 在非 UTF-8 locale 下会带 \udcXX 代理字符，先还原再交给 core
+            goal = sanitize_text(goal.strip())
         except (EOFError, KeyboardInterrupt):
             print()
             break

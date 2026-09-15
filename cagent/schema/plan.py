@@ -100,3 +100,14 @@ class Plan(BaseModel):
         if changed:
             self.version += 1
         return changed
+
+
+class RunResult(BaseModel):
+    """Agent 运行的结构化返回结果。
+
+    替代原有的纯字符串返回，同时包含最终答案和完整的执行计划。
+    """
+
+    answer: str
+    plan: Plan
+

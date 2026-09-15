@@ -103,11 +103,11 @@ def test_agent_loop_with_fake_llm():
     reg.register(add)
     storage = get_storage(tempfile.mkdtemp())
     agent = Agent(llm=llm, tools=reg, storage=storage, max_steps=10)
-    out = agent.run("测试")
+    result = agent.run("测试")
 
-    assert "2" in out
+    assert "2" in result.answer
     # summarize 由 LLM 生成，不再是纯拼接
-    assert "最终结果" in out
+    assert "最终结果" in result.answer
     # 会话应已落盘 meta/plan/trace
     keys = storage.list_keys("sessions/")
     assert any(k.endswith("meta.json") for k in keys)

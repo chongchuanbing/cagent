@@ -177,8 +177,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     emitter = EventEmitter()
     emitter.subscribe(create_display_handler())
+    from cagent.utils import sanitize_text
+
     agent, _ = _build_agent(args.config, emitter=emitter)
-    agent.run(args.goal, session_id=args.session_id, resume=args.resume,
+    # 输入边界：argv 在非 UTF-8 locale 下会带 \udcXX 代理字符，先还原再交给 core
+    agent.run(sanitize_text(args.goal), session_id=args.session_id, resume=args.resume,
               space_dir=getattr(args, "space", None), model=getattr(args, "model", None))
     # 最终答案已由 FINAL_ANSWER 事件渲染，无需重复 print
     return 0

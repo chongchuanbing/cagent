@@ -348,4 +348,4 @@ class TestAgentLoopAdjust:
 
         # 不应抛异常
         result = loop.run("测试")
-        assert "最终结果" in result
+        assert "最终结果" in result.answer

@@ -78,7 +78,7 @@ class AgentService:
 
             try:
                 result = agent.run(goal=task.goal, session_id=task_id)
-                task.result = result
+                task.result = result.answer
                 task.status = "completed"
             except Exception as e:
                 task.status = "failed"

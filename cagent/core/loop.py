@@ -4,6 +4,7 @@ import traceback
 from typing import List, Optional
 
 from ..schema.plan import Plan, Step, StepResult, StepStatus
+from ..schema.plan import RunResult
 from ..schema.action import Observation
 from ..schema.message import Message, MessageRole
 from ..llm.base import LLMClient
@@ -66,7 +67,7 @@ class AgentLoop:
         prior_history: List[dict] = None,
         resume_plan: Optional[Plan] = None,
         resume_history: Optional[List[dict]] = None,
-    ) -> str:
+    ) -> RunResult:
         """运行至计划完成或终止条件触发，返回最终答案。
 
         recorder 为 SessionRecorder 时，会把 meta / plan / 每步 trace 落盘；
@@ -100,7 +101,7 @@ class AgentLoop:
         prior_history: Optional[List[dict]] = None,
         resume_plan: Optional[Plan] = None,
         resume_history: Optional[List[dict]] = None,
-    ) -> str:
+    ) -> RunResult:
         logger.info(f"_run: 开始执行目标 - {goal[:100]}")
         if recorder:
             recorder.record_meta(goal)
@@ -152,9 +153,26 @@ class AgentLoop:
                     {"step": {"id": step.id, "description": step.description}},
                     session_id=session_id, step_id=step.id,
                 )
-                result: StepResult = self.executor.execute_step(
-                    step, history=memory_prefix + history, goal=goal
+                # execute_step 调用：带详细诊断日志，便于快速定位崩溃原因
+                _history_snapshot = memory_prefix + history
+                logger.info(
+                    f"_run: execute_step 调用前诊断 | step_id={step.id} | "
+                    f"history_len={len(_history_snapshot)} (memory_prefix={len(memory_prefix)}, history={len(history)}) | "
+                    f"goal_len={len(goal)} | step_status={step.status.value}"
                 )
+                try:
+                    result: StepResult = self.executor.execute_step(
+                        step, history=_history_snapshot, goal=goal
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"_run: execute_step 异常 | step_id={step.id} | "
+                        f"history_len={len(_history_snapshot)} | "
+                        f"goal={goal[:80]} | "
+                        f"error_type={type(e).__name__} | error={e}",
+                        exc_info=True,
+                    )
+                    raise
                 logger.info(f"_run: 步骤 {step.id} 执行完成，状态: {'成功' if result.success else '失败'}")
                 trace = self.executor.react_engine.last_trace
                 if recorder:
@@ -221,9 +239,18 @@ class AgentLoop:
             if recorder:
                 recorder.finish()
         except Exception:
-            # 异常中断：标记 meta.status = "interrupted"，保留已执行步骤的状态，
-            # 下次 resume 时 Agent.run() 可检测到并走中断恢复路径
-            logger.exception("_run: 执行异常，标记会话为中断状态")
+            # 异常中断：记录详细诊断信息后标记为 interrupted
+            _pending = plan.pending_steps() if plan else []
+            _done = [s for s in (plan.steps if plan else []) if s.status == StepStatus.DONE]
+            _running = [s for s in (plan.steps if plan else []) if s.status == StepStatus.RUNNING]
+            logger.error(
+                f"_run: 执行异常，标记会话为中断状态 | "
+                f"goal={goal[:80]} | executed={executed} | "
+                f"plan_total={len(plan.steps) if plan else 0} | done={len(_done)} | "
+                f"pending={len(_pending)} | running={len(_running)} | "
+                f"history_len={len(history)}",
+                exc_info=True,
+            )
             if recorder:
                 try:
                     recorder.finish(status="interrupted")
@@ -259,7 +286,7 @@ class AgentLoop:
         # 度量采集：标记 turn 结束
         self._emit(EventType.TURN_FINISHED, {"status": "done"}, session_id=session_id)
 
-        return answer
+        return RunResult(answer=answer, plan=plan)
 
     def _should_terminate(self, plan: Plan) -> bool:
         """计划全部完成 / 全部终态则终止。"""

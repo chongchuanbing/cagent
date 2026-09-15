@@ -11,7 +11,6 @@ from ..config.provider import ConfigProvider
 from ..config.schema import PathSpaceConfig
 from ..events import EventEmitter
 from ..memory import MemoryService
-from ..utils import sanitize_text
 from ..utils.logging import get_logger, setup_session_logger, teardown_session_logger
 from ..plugins.capability import CapabilityProbe
 from .failure_ledger import FailureLedger
@@ -19,6 +18,7 @@ from .planner import Planner
 from .react import ReActEngine
 from .executor import Executor
 from .loop import AgentLoop
+from ..schema.plan import RunResult
 from ..metrics import MetricsCollector, JsonlMetricsBackend
 
 logger = get_logger("agent")
@@ -242,7 +242,7 @@ class Agent:
         resume: bool = False,
         space_dir: Optional[str] = None,
         model: Optional[str] = None,
-    ) -> str:
+    ) -> RunResult:
         """执行目标任务，返回最终答案；过程落盘到 sessions/<session_id>/。
 
         - resume=True 时，从该 session 的 trace.jsonl 重建历史上下文，
@@ -252,9 +252,9 @@ class Agent:
         - model 覆盖本次 run 使用的模型 id（需在 models.json 中已配置）；
           不传则使用默认模型。
         """
-        # 终端在非 UTF-8 环境下粘贴的内容会带 \udcXX 代理字符，
-        # 不清洗的话落盘/JSON 序列化会报 surrogates not allowed
-        goal = sanitize_text(goal)
+        # 输入清洗（终端代理字符还原）由客户端边界负责：
+        # CLI run 的 argv、chat 的 stdin、ask_user 工具的 stdin 在入口处 sanitize；
+        # 落盘防崩由 storage.write_json 安全网兜底。此处只接受干净的 str。
         # L5: 每次 run 重置失败账本，避免跨 run 累积误判
         self.failure_ledger.reset()
         sid = session_id or uuid.uuid4().hex
@@ -360,7 +360,7 @@ class Agent:
         self,
         session_id: Optional[str] = None,
         space_dir: Optional[str] = None,
-    ) -> str:
+    ) -> RunResult:
         """从上次中断的会话恢复执行。
 
         与 run() 的区别：
